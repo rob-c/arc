@@ -554,6 +554,7 @@ class JobsControl(ComponentControl):
         if AccountingControl is not None:
             # add 'job accounting xxx' functionality as well as 'accounting job xxx'
             jobs_accounting = jobs_actions.add_parser('accounting', help='Show job accounting data')
+            jobs_accounting.add_argument('--database-file', help='Set custom location of accounting database to work with. Path or file name inside controldir.')
             AccountingControl.register_job_parser(jobs_accounting)
 
 

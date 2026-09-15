@@ -568,7 +568,7 @@ class AccountingControl(ComponentControl):
 
     def control(self, args):
         # optional custom database location (e.g. backup copy)
-        if "database_file" in args:
+        if args.database_file:
             self.__set_db_location(args.database_file)
         # action-based routines
         if args.action == 'stats':
@@ -585,7 +585,7 @@ class AccountingControl(ComponentControl):
 
     # bash-completion helpers
     def __init_adb_location(self, args):
-        if "database_file" in args:
+        if args.database_file:
             self.__set_db_location(args.database_file)
         self.__init_adb()
 

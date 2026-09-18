@@ -78,9 +78,13 @@ namespace Arc {
 
     virtual void msg(std::ostream& os) const {
       char buffer[2048];
-      int n = ::snprintf(buffer, sizeof(buffer), Get(m),
-                         Get(t0), Get(t1), Get(t2), Get(t3),
-                         Get(t4), Get(t5), Get(t6), Get(t7));
+      int nbytes = ::snprintf(buffer, sizeof(buffer), Get(m),
+                              Get(t0), Get(t1), Get(t2), Get(t3),
+                              Get(t4), Get(t5), Get(t6), Get(t7));
+      if (nbytes < 0) {
+        return;
+      }
+      size_t n = size_t(nbytes);
       if (n >= sizeof(buffer)) {
         char* bigbuf = (char*)::malloc(n+1);
         if (bigbuf != NULL) {
@@ -97,9 +101,13 @@ namespace Arc {
 
     virtual void msg(std::string& s) const {
       char buffer[2048];
-      int n = ::snprintf(buffer, sizeof(buffer), Get(m),
-                         Get(t0), Get(t1), Get(t2), Get(t3),
-                         Get(t4), Get(t5), Get(t6), Get(t7));
+      int nbytes = ::snprintf(buffer, sizeof(buffer), Get(m),
+                              Get(t0), Get(t1), Get(t2), Get(t3),
+                              Get(t4), Get(t5), Get(t6), Get(t7));
+      if (nbytes < 0) {
+        return;
+      }
+      size_t n = size_t(nbytes);
       if (n >= sizeof(buffer)) {
         char* bigbuf = (char*)::malloc(n+1);
         if (bigbuf != NULL) {

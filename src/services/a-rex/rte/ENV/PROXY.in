@@ -17,7 +17,7 @@ if [ "x$1" = "x0" ]; then
 
     if [ "x$COPY_CACERT_DIR" = "xYes" ]; then
         cacert_staged=
-        if [ "x$CACERT_TAR" = "xYes" ]; then
+        if [ "x$CACERT_TAR" = "xYes" ] && [ -n "${CACERT_TAR_CACHE:-${CONFIG_controldir}}" ]; then
             # Stage the CA directory as one file rather than as its contents.
             # A CA directory is on the order of a thousand small files, and
             # copying them individually costs that many metadata operations on
@@ -25,7 +25,11 @@ if [ "x$1" = "x0" ]; then
             # been queued. The archive is built once and reused until the CA
             # directory changes, and is only unpacked if the job actually
             # starts running (stage 1).
-            cacert_tar="${CACERT_TAR_CACHE:-${joboption_controldir}/ca-certificates.tar}"
+            # CONFIG_controldir, not joboption_controldir: the latter is the
+            # directory holding this job's grami file and goes away with the
+            # job, which would mean rebuilding the archive for every
+            # submission instead of reusing it.
+            cacert_tar="${CACERT_TAR_CACHE:-${CONFIG_controldir}/ca-certificates.tar}"
             # Rebuild when anything in the CA directory is newer than the
             # archive. find stops at the first newer entry, so an unchanged
             # directory costs a local scan rather than a repack.

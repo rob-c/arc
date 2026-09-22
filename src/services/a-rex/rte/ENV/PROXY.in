@@ -1,9 +1,12 @@
 # description: copy proxy certificate to the job session directory
 # param:COPY_CACERT_DIR:Yes,No:Yes:If set to Yes, CA certificate dir will be copied to the session directory along with proxy certificate
+# param:CACERT_TAR:Yes,No:Yes:If set to Yes the CA certificate dir is staged as a single archive and unpacked on the worker node instead of being copied file by file
+# param:CACERT_TAR_CACHE:string::Path of the generated CA archive (default: <controldir>/ca-certificates.tar)
 # param:USE_DELEGATION_DB:Yes,No:No:If set to Yes RTE will try to extract proxy certificate from A-REX delegation DB (works in limited number of cases)
 # param:X509_CERT_DIR:string:/etc/pki/tls/certs:CAdir to use (either /etc/grid-security/certificates or system folder depending on x509_cert_policy grid or system)
 
 COPY_CACERT_DIR="${COPY_CACERT_DIR:-Yes}"
+CACERT_TAR="${CACERT_TAR:-Yes}"
 USE_DELEGATION_DB="${USE_DELEGATION_DB:-No}"
 X509_CERT_DIR="${X509_CERT_DIR:-/etc/grid-security/certificates}"
 
@@ -11,10 +14,43 @@ X509_CERT_DIR="${X509_CERT_DIR:-/etc/grid-security/certificates}"
 if [ "x$1" = "x0" ]; then
 
     PROXY_FILE=$(control_path "${joboption_controldir}" "${joboption_gridid}" "proxy")
-   
+
     if [ "x$COPY_CACERT_DIR" = "xYes" ]; then
-        mkdir -pv ${joboption_directory}/arc/certificates/
-        cp -rv ${X509_CERT_DIR}/* ${joboption_directory}/arc/certificates/
+        cacert_staged=
+        if [ "x$CACERT_TAR" = "xYes" ]; then
+            # Stage the CA directory as one file rather than as its contents.
+            # A CA directory is on the order of a thousand small files, and
+            # copying them individually costs that many metadata operations on
+            # the session filesystem for every job, before the job has even
+            # been queued. The archive is built once and reused until the CA
+            # directory changes, and is only unpacked if the job actually
+            # starts running (stage 1).
+            cacert_tar="${CACERT_TAR_CACHE:-${joboption_controldir}/ca-certificates.tar}"
+            # Rebuild when anything in the CA directory is newer than the
+            # archive. find stops at the first newer entry, so an unchanged
+            # directory costs a local scan rather than a repack.
+            if [ ! -f "${cacert_tar}" ] || \
+               [ -n "$(find "${X509_CERT_DIR}/" -newer "${cacert_tar}" -print -quit 2>/dev/null)" ]; then
+                cacert_tmp="${cacert_tar}.$$"
+                if tar cf "${cacert_tmp}" -C "${X509_CERT_DIR}" . 2>/dev/null; then
+                    # Published atomically: a concurrent submission either sees
+                    # the previous archive or this one, never a partial file.
+                    mv -f "${cacert_tmp}" "${cacert_tar}" 2>/dev/null || rm -f "${cacert_tmp}"
+                else
+                    rm -f "${cacert_tmp}"
+                fi
+            fi
+            if [ -f "${cacert_tar}" ]; then
+                mkdir -p "${joboption_directory}/arc"
+                cp "${cacert_tar}" "${joboption_directory}/arc/certificates.tar" && cacert_staged=tar
+            fi
+        fi
+        if [ -z "${cacert_staged}" ]; then
+            # Archive disabled, or it could not be built - for instance where
+            # the control directory is read-only. Fall back to the copy.
+            mkdir -pv ${joboption_directory}/arc/certificates/
+            cp -rv ${X509_CERT_DIR}/* ${joboption_directory}/arc/certificates/
+        fi
     fi
     if [ "x$USE_DELEGATION_DB" = "xYes" ]; then
         GM_JOBS="${ARC_LOCATION:-@prefix@}/@pkglibexecsubdir@/gm-jobs"
@@ -29,6 +65,16 @@ elif [ "x$1" = "x1" ]; then
     export X509_USER_PROXY="${X509_USER_PROXY:-${RUNTIME_JOB_DIR}/user.proxy}"
     export X509_USER_CERT="${X509_USER_CERT:-${RUNTIME_JOB_DIR}/user.proxy}"
     if [ "x$COPY_CACERT_DIR" = "xYes" ]; then
+        # This stage runs from the job script, so the archive is unpacked on
+        # the worker node and only for a job that actually started. Jobs that
+        # are cancelled or never scheduled never pay for it. Staging by copy
+        # is still handled, so a job submitted before this RTE changed, or by
+        # a site with CACERT_TAR=No, keeps working.
+        if [ -f "${RUNTIME_JOB_DIR}/arc/certificates.tar" ]; then
+            mkdir -p "${RUNTIME_JOB_DIR}/arc/certificates"
+            tar xf "${RUNTIME_JOB_DIR}/arc/certificates.tar" \
+                -C "${RUNTIME_JOB_DIR}/arc/certificates" 2>/dev/null
+        fi
         export X509_CERT_DIR="${RUNTIME_JOB_DIR}/arc/certificates"
     else
         export X509_CERT_DIR="${X509_CERT_DIR:-/etc/grid-security/certificates}"
@@ -36,5 +82,6 @@ elif [ "x$1" = "x1" ]; then
 elif [ "x$1" = "x2" ]; then
     if [ "x$COPY_CACERT_DIR" = "xYes" ]; then
         rm -rf ${RUNTIME_JOB_DIR}/arc/certificates
+        rm -f ${RUNTIME_JOB_DIR}/arc/certificates.tar
     fi
 fi

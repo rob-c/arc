@@ -9,6 +9,8 @@
 #endif
 
 #include <stdio.h>
+#include <errno.h>
+#include <ctype.h>
 
 #include "PayloadHTTP.h"
 #include <arc/StringConv.h>
@@ -375,7 +377,26 @@ bool PayloadHTTPIn::read_header(void) {
   std::map<std::string,std::string>::iterator it;
   it=attributes_.find("content-length");
   if(it != attributes_.end()) {
-    length_=strtoll(it->second.c_str(),NULL,10);
+    // Only digits are allowed here. strtoll() would otherwise accept a sign
+    // and stop at the first character it cannot use, so "-5" became the
+    // value this code uses to mean "length unknown, read until close" and
+    // "12abc" silently became 12. Either lets this reader and an
+    // intermediary disagree about where the body ends.
+    std::string value = trim(it->second," \t");
+    bool ok = !value.empty();
+    for(std::string::size_type n = 0; ok && (n < value.length()); ++n) {
+      if(!isdigit((unsigned char)value[n])) ok = false;
+    };
+    if(ok) {
+      errno = 0;
+      char* e = NULL;
+      length_ = strtoll(value.c_str(),&e,10);
+      if((errno == ERANGE) || (*e != 0) || (length_ < 0)) ok = false;
+    };
+    if(!ok) {
+      logger.msg(VERBOSE,"Malformed Content-Length in HTTP header: %s",it->second);
+      return false;
+    };
   };
   it=attributes_.find("content-range");
   if(it != attributes_.end()) {

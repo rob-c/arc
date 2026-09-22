@@ -18,6 +18,8 @@ class PayloadHTTPChunkedTest: public CppUnit::TestFixture {
   CPPUNIT_TEST(TestWellFormedChunks);
   CPPUNIT_TEST(TestNegativeChunkSize);
   CPPUNIT_TEST(TestGarbageChunkSize);
+  CPPUNIT_TEST(TestContentLengthRejected);
+  CPPUNIT_TEST(TestContentLengthAccepted);
   CPPUNIT_TEST_SUITE_END();
 public:
   void setUp() {
@@ -30,6 +32,8 @@ public:
   void TestWellFormedChunks();
   void TestNegativeChunkSize();
   void TestGarbageChunkSize();
+  void TestContentLengthRejected();
+  void TestContentLengthAccepted();
 private:
   int fds[2];
   // Feed a complete chunked response and hand back the parsed payload. The
@@ -40,6 +44,9 @@ private:
                          write(fds[1], data.data(), data.size()));
     close(fds[1]);
     fds[1] = dup(fds[0]); // keep tearDown's second close valid
+  }
+  static std::string lengthResponse(const std::string& length, const std::string& body) {
+    return std::string("HTTP/1.1 200 OK\r\nContent-Length: ") + length + "\r\n\r\n" + body;
   }
   static std::string response(const std::string& body) {
     return std::string("HTTP/1.1 200 OK\r\n")
@@ -79,6 +86,38 @@ void PayloadHTTPChunkedTest::TestGarbageChunkSize() {
   char buf[32];
   int size = sizeof(buf);
   CPPUNIT_ASSERT(!payload.Get(buf, size));
+}
+
+void PayloadHTTPChunkedTest::TestContentLengthRejected() {
+  // Only digits are valid. Accepting a sign or trailing text lets this reader
+  // and an intermediary disagree about where the body ends.
+  struct { const char* length; const char* why; } const cases[] = {
+    {"-5",      "a negative length was taken as 'read until close'"},
+    {"12abc",   "trailing text was ignored and the digits used"},
+    {"garbage", "a non-numeric value silently became zero"},
+    {"",        "an empty value silently became zero"}
+  };
+  for(unsigned n = 0; n < sizeof(cases)/sizeof(cases[0]); ++n) {
+    CPPUNIT_ASSERT_EQUAL(0, pipe(fds));
+    feed(lengthResponse(cases[n].length, "data"));
+    Arc::PayloadStream stream(fds[0]);
+    ArcMCCHTTP::PayloadHTTPIn payload(stream);
+    CPPUNIT_ASSERT_MESSAGE(cases[n].why, !(bool)payload);
+    close(fds[0]); close(fds[1]);
+  }
+  CPPUNIT_ASSERT_EQUAL(0, pipe(fds)); // leave tearDown something to close
+}
+
+void PayloadHTTPChunkedTest::TestContentLengthAccepted() {
+  feed(lengthResponse("4", "data"));
+  Arc::PayloadStream stream(fds[0]);
+  ArcMCCHTTP::PayloadHTTPIn payload(stream);
+  CPPUNIT_ASSERT(payload);
+  char buf[32];
+  int size = sizeof(buf);
+  CPPUNIT_ASSERT(payload.Get(buf, size));
+  CPPUNIT_ASSERT_EQUAL(4, size);
+  CPPUNIT_ASSERT_EQUAL(std::string("data"), std::string(buf, 4));
 }
 
 CPPUNIT_TEST_SUITE_REGISTRATION(PayloadHTTPChunkedTest);

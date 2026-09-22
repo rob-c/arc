@@ -50,6 +50,13 @@ namespace ARex {
             closeDB();
             return;
         };
+        // Accounting is written while jobs are being processed, and the
+        // default rollback journal costs a journal file created, written,
+        // synced and deleted for every transaction - of which a single job
+        // record makes several. Write-ahead logging keeps that off the job
+        // path, and NORMAL risks only the most recent commits on a host
+        // crash rather than database integrity.
+        (void)exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
         if (create) {
             std::string db_schema_str;
             std::string sql_file = Arc::ArcLocation::Get() + G_DIR_SEPARATOR_S + PKGDATASUBDIR +

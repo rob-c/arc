@@ -86,6 +86,10 @@ namespace ARex {
       db_ = NULL;
       return false;
     };
+    // Delegations are written and looked up on the job path, so avoid the
+    // default rollback journal's file create, sync and delete per
+    // transaction. See the matching comment in AccountingDBSQLite.
+    (void)sqlite3_exec_nobusy("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
     if(create) {
       if(!dberr("Error creating table rec", sqlite3_exec_nobusy("CREATE TABLE IF NOT EXISTS rec(id, owner, uid, meta, UNIQUE(id, owner), UNIQUE(uid))", NULL, NULL, NULL))) {
         (void)sqlite3_close(db_); // todo: handle error

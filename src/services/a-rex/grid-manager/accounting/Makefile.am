@@ -10,7 +10,7 @@ libaccounting_la_LIBADD = \
 	$(top_builddir)/src/hed/libs/common/libarccommon.la \
 	$(SQLITE_LIBS)
 
-noinst_PROGRAMS = test_adb
+noinst_PROGRAMS = test_adb bench_adb
 
 test_adb_SOURCES = test_adb.cpp
 test_adb_CXXFLAGS = -I$(top_srcdir)/include \
@@ -21,3 +21,6 @@ arcsqlschemadir = $(pkgdatadir)/sql-schema
 arcsqlschema_DATA = arex_accounting_db_schema_v2.sql
 EXTRA_DIST = $(arcsqlschema_DATA)
 
+bench_adb_SOURCES = bench_adb.cpp
+bench_adb_CXXFLAGS = $(test_adb_CXXFLAGS)
+bench_adb_LDADD = libaccounting.la

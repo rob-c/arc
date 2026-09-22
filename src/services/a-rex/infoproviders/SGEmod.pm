@@ -1201,9 +1201,20 @@ sub queue_info ($) {
             my $raw = $values[$index];
             $raw =~ s/^\s+|\s+$//g;
             if ($index) {
+                # Per-hostgroup overrides are validated but do not change what
+                # we publish. The queue-wide default is the limit that applies
+                # to any host not covered by an override, whereas the smallest
+                # override can describe a very small corner of the queue: on
+                # EDDIE one hostgroup caps wall time at 31 minutes while the
+                # queue default is 48 hours, so publishing the minimum would
+                # advertise a limit that rejects essentially all real work.
                 die "Invalid host override in qconf -sq: $l\n"
                     unless $raw =~ /^\[[^\s=\[\]]+=([^\[\]]+)\]$/;
-                $raw = $1;
+                my $override = $1;
+                die "Invalid time limit in qconf -sq: $l\n"
+                    unless defined parse_duration($override)
+                            or $override eq 'INFINITY';
+                next;
             }
             my $timelimit = parse_duration($raw);
             if (not defined $timelimit) {

@@ -289,15 +289,15 @@ ENDSIMULATOROUTPUT
   is($queue->{maxrunning}, 12, 'queue maxrunning');
   is($queue->{maxqueuable}, 50, 'queue maxqueuable');
   is($queue->{maxuserrun}, 3, 'scheduler running-jobs-per-user limit');
-  is($queue->{maxcputime}, 1800, 'lowest queue-instance CPU limit');
-  is($queue->{maxwalltime}, 2700, 'lowest continued queue-instance wall limit');
+  is($queue->{maxcputime}, 2700, 'queue-default CPU limit ignores host overrides');
+  is($queue->{maxwalltime}, 5400, 'queue-default wall limit ignores host overrides');
   is($queue->{mincputime}, 0, 'queue minimum CPU time');
   is($queue->{minwalltime}, 0, 'queue minimum wall time');
   is_deeply($queue->{nodes}, [qw(node1.site.org node2.site.org)], 'queue nodes');
   is($queue->{users}{alice}{queuelength}, 5, 'alice queued tasks');
-  is_deeply($queue->{users}{alice}{freecpus}, { 6 => 45 }, 'alice free CPUs use minutes, not queue-limit seconds');
+  is_deeply($queue->{users}{alice}{freecpus}, { 6 => 90 }, 'alice free CPUs use minutes, not queue-limit seconds');
   is($queue->{users}{bob}{queuelength}, 1, 'bob queued jobs');
-  is_deeply($queue->{users}{bob}{freecpus}, { 6 => 45 }, 'bob free CPUs');
+  is_deeply($queue->{users}{bob}{freecpus}, { 6 => 90 }, 'bob free CPUs');
   is($lrms_info->{queues}{gpu}{users}{alice}{queuelength}, 0,
      'per-user pending count is filtered by share');
 
@@ -346,7 +346,7 @@ ENDSIMULATOROUTPUT
   is($again->{cluster}{lrms_type}, 'SGE', 'long Altair banner keeps canonical type');
   is($again->{cluster}{lrms_version}, '8.9.0', 'long Altair banner technical version');
   is($again->{cluster}{queuedjobs}, 6, 'queued counter reset between collections');
-  is_deeply($again->{queues}{production}{users}{alice}{freecpus}, { 6 => 45 }, 'user counters reset between collections');
+  is_deeply($again->{queues}{production}{users}{alice}{freecpus}, { 6 => 90 }, 'user counters reset between collections');
 
   # A failed query may still have emitted well-formed but incomplete XML.  It
   # must not replace the last complete snapshot with that data.

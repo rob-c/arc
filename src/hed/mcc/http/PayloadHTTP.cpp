@@ -695,6 +695,10 @@ bool PayloadHTTPIn::Truncate(PayloadRawInterface::Size_t size) {
 
 bool PayloadHTTPIn::Get(char* buf,int& size) {
   if(!valid_) return false;
+  // A negative size compares as larger than any byte count once promoted to
+  // unsigned below, so the clamp against the caller's buffer would be skipped
+  // and memcpy() would copy the whole remaining body into it.
+  if(size < 0) { size = 0; return false; };
   if(fetched_) {
     // Read from buffer
     if(stream_offset_ < body_size_) {

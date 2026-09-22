@@ -30,17 +30,24 @@ parse_arc_conf () {
   queue_options="defaultmemory benchmark $queue_options"
 
   # Starting the config parser dominates the cost of a submission: it is
-  # Python, and the interpreter start outweighs the parse itself. It accepts
-  # several blocks in one call, so read together the ones that can be.
+  # Python, and the interpreter start outweighs the parse itself. Reading one
+  # block per call meant starting it four times for a queued job.
   #
-  # common, arex and lrms name disjoint options, so reading them in one call
-  # gives the same values as reading them in turn. The queue block cannot
-  # join them: it deliberately repeats options from lrms, such as benchmark
-  # and defaultmemory, so that a queue can override them, and that precedence
-  # only holds when it is read afterwards in a call of its own.
+  # It takes several blocks in one call, and export_bash() reverses the list
+  # before merging, so the block named first wins where two of them define
+  # the same option. Listing them highest precedence first therefore gives
+  # exactly what reading them in turn used to: the queue block still
+  # overrides lrms for the options it repeats, benchmark and defaultmemory
+  # among them, which matters because benchmark feeds accounting.
   blockargs=""
   optfilter=""
-  for block in common arex lrms; do
+  if [ -n "$joboption_queue" ]; then
+    blockargs="-b queue:$joboption_queue"
+    for opt in $queue_options; do
+      optfilter="$optfilter -f $opt"
+    done
+  fi
+  for block in lrms arex common; do
     blockargs="$blockargs -b $block"
     eval "block_options=\${${block}_options}"
     for opt in $block_options; do
@@ -49,14 +56,6 @@ parse_arc_conf () {
   done
   # parse options (assumes runconfig comes from a-rex)
   eval $( $pkglibexecdir/arcconfig-parser --load -r ${ARC_CONFIG} --export bash $blockargs $optfilter )
-
-  if [ -n "$joboption_queue" ]; then
-    optfilter=""
-    for opt in $queue_options; do
-      optfilter="$optfilter -f $opt"
-    done
-    eval $( $pkglibexecdir/arcconfig-parser --load -r ${ARC_CONFIG} --export bash -b "queue:$joboption_queue" $optfilter )
-  fi
 
   # cleanup env
   unset opt optfilter block blockargs block_options arex_options common_options

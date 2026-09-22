@@ -184,6 +184,47 @@ sub count_array_spec($) {
     return $count;
 }
 
+# Grid Engine writes '-' for any value it does not have, most commonly for
+# every field of a host that is down or unreachable, and for the synthetic
+# 'global' host. Return the value only when it is present and matches
+# $pattern, so that the placeholder never reaches a numeric comparison,
+# a sum, or the published information.
+sub value_or_undef($$) {
+    my ($value, $pattern) = @_;
+    return undef unless defined $value;
+    $value =~ s/^\s+//;
+    $value =~ s/\s+$//;
+    return undef if $value eq '' or $value eq '-';
+    return undef unless $value =~ $pattern;
+    return $value;
+}
+
+# Parse a Grid Engine time specification into seconds.
+#
+# The value may carry per-hostgroup overrides and be wrapped over several
+# lines by qconf, e.g.
+#
+#   h_rt   48:10:00,[@clock_30min=00:32:00],[@ringfence_gridpp=672:10:00], \
+#                   [@clock_4week=672:10:00]
+#
+# Everything up to the first comma is the queue-wide default, which is what
+# applies to any host not covered by an override, so that is the value we
+# publish. Returns undef for INFINITY and for anything unparsable; the
+# caller decides which of those is worth warning about.
+sub sge_timelimit($) {
+    my $value = shift;
+    return undef unless defined $value;
+    $value =~ s/,.*$//;      # drop per-hostgroup overrides
+    $value =~ s/^\s+//;
+    $value =~ s/\s+$//;
+    $value =~ s/\s*\\$//;    # drop a trailing line-continuation marker
+    return undef if $value eq '' or uc($value) eq 'INFINITY';
+    return $3 + 60 * ($2 + 60 * $1) if $value =~ /^(\d+):(\d+):(\d+)$/;
+    return $2 + 60 * $1              if $value =~ /^(\d+):(\d+)$/;
+    return $1                        if $value =~ /^(\d+)$/;
+    return undef;
+}
+
 #
 # this block contains the functions used to parse the output of qstat
 #
@@ -470,14 +511,32 @@ sub run_qconf {
     my $xml = XMLin($qhost_xml_output, KeyAttr => { host => 'name' }, ForceArray => [ 'host' ]);
     for my $h ( keys %{$xml->{host}} ) {
             next if $h eq "global";
-            $node_stats{$h}{arch} =$xml->{host}{$h}{"hostvalue"}[0]{content};
-            $node_stats{$h}{totalcpus} = $xml->{host}{$h}{"hostvalue"}[1]{content};
-    } 
+            # Look the values up by name rather than by position: the order of
+            # the hostvalue elements is not guaranteed and differs between
+            # Grid Engine flavours (Univa reports m_socket/m_core/m_thread
+            # between arch_string and the load values).
+            my $hostvalues = $xml->{host}{$h}{"hostvalue"};
+            $hostvalues = [ $hostvalues ] unless ref($hostvalues) eq 'ARRAY';
+            my %hostvalue;
+            for my $v ( @$hostvalues ) {
+                next unless ref($v) eq 'HASH' and defined $v->{name};
+                $hostvalue{$v->{name}} = $v->{content};
+            }
+            # Grid Engine reports '-' for every value of a host it cannot
+            # reach. Leaving that in place puts a non-numeric string into
+            # totalcpus, which then leaks into numeric comparisons and sums.
+            $node_stats{$h}{arch} = value_or_undef($hostvalue{arch_string}, qr/\S/);
+            $node_stats{$h}{totalcpus} = value_or_undef($hostvalue{num_proc}, qr/^\d+$/);
+    }
 
     my %cpuhash;
-    $cpuhash{$_->{totalcpus}}++ for values %node_stats;
+    for my $node ( values %node_stats ) {
+        my $cpus = $node->{totalcpus};
+        next unless defined $cpus and $cpus > 0;
+        $cpuhash{$cpus}++;
+    }
     while ( my ($cpus,$count)  = each %cpuhash ) {
-        $cpudistribution .= "${cpus}cpu:$count " if $cpus > 0;
+        $cpudistribution .= "${cpus}cpu:$count ";
     }
     chop $cpudistribution;
 
@@ -671,20 +730,27 @@ sub queue_info ($) {
     # wall clock time. Nordugrid schema only has CPU time.
     # The lowest of the 2 limits is returned by this code.
 
-    # This code breaks if there are some nodes with separate limits:
-    # h_rt                  48:00:00,[cpt.uio.no=24:00:00]
+    # Nodes may carry limits of their own, which qconf appends to the
+    # queue-wide default as a comma separated list of hostgroup overrides,
+    # wrapping the result over several lines:
+    #
+    #   h_rt   48:00:00,[cpt.uio.no=24:00:00]
+    #   h_rt   48:10:00,[@clock_30min=00:32:00],[@ringfence_gridpp=672:10:00], \
+    #                   [@clock_4week=672:10:00]
+    #
+    # sge_timelimit() takes the queue-wide default from the front of such a
+    # list. The continuation lines carry only overrides, so they do not match
+    # the patterns below and are skipped.
 
     my $command = "$path/qconf -sq @qnames";
     loop_callback($command, sub {
         my $l = shift;
-        if ($l =~ /^[sh]_rt\s+(\S+)/) {
-            return if $1 eq 'INFINITY';
-            my $timelimit;
-            if ($1 =~ /^(\d+):(\d+):(\d+)$/) {
-                my ($h,$m,$s) = ($1,$2,$3);
-                $timelimit = $s + 60 * ($m + 60 * $h);
-            } else {
-                $log->warning("Error extracting time limit from line: $l");
+        if ($l =~ /^[sh]_rt\s+(.*\S)/) {
+            my $spec = $1;
+            my $timelimit = sge_timelimit($spec);
+            unless (defined $timelimit) {
+                $log->warning("Error extracting time limit from line: $l")
+                    unless $spec =~ /^INFINITY\b/i;
                 return;
             }
             if (not defined $lrms_queue->{maxwalltime}
@@ -692,14 +758,12 @@ sub queue_info ($) {
                 $lrms_queue->{maxwalltime} = $timelimit;
             }
         }
-        elsif ($l =~ /^[sh]_cpu\s+(\S+)/) {
-            return if $1 eq 'INFINITY';
-            my $timelimit;
-            if ($1 =~ /^(\d+):(\d+):(\d+)$/) {
-                my ($h,$m,$s) = ($1,$2,$3);
-                $timelimit = $s + 60 * ($m + 60 * $h);
-            } else {
-                $log->warning("Error extracting time limit from line: $l");
+        elsif ($l =~ /^[sh]_cpu\s+(.*\S)/) {
+            my $spec = $1;
+            my $timelimit = sge_timelimit($spec);
+            unless (defined $timelimit) {
+                $log->warning("Error extracting time limit from line: $l")
+                    unless $spec =~ /^INFINITY\b/i;
                 return;
             }
             if (not defined $lrms_queue->{maxcputime}

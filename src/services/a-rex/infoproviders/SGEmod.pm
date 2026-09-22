@@ -9,6 +9,20 @@ use LogUtils;
 use Text::ParseWords qw(shellwords);
 use XML::Simple qw(:strict);
 
+# XML::Simple hands the work to XML::SAX, which falls back to
+# XML::SAX::PurePerl when nothing faster has been registered. This module
+# parses several megabytes of qstat output per collection cycle, and the pure
+# Perl parser is roughly an order of magnitude slower than expat on that:
+# 2.4MB takes about 7 seconds through XML::SAX::PurePerl against under 1
+# through XML::Parser. Prefer XML::Parser where it is installed, and leave
+# the choice to XML::SAX where it is not.
+BEGIN {
+    eval {
+        require XML::Parser;
+        $XML::Simple::PREFERRED_PARSER = 'XML::Parser';
+    };
+}
+
 use strict;
 
 our $path;

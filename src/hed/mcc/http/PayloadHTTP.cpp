@@ -125,6 +125,10 @@ bool PayloadHTTPIn::readline(std::string& line) {
 }
 
 bool PayloadHTTPIn::read(char* buf,int64_t& size) {
+  // Defence in depth for the callers that derive this from a length taken
+  // off the wire: a negative size would satisfy the comparison below and be
+  // handed to memcpy() as a very large size_t.
+  if(size < 0) { size = 0; return false; };
   if(tbuflen_ >= size) {
     memcpy(buf,tbuf_,size);
     memmove(tbuf_,tbuf_+size,tbuflen_-size+1);
@@ -177,6 +181,11 @@ bool PayloadHTTPIn::read_chunked(char* buf,int64_t& size) {
       chunk_size_ = strtoll(line.c_str(),&e,16);
       if((*e != ';') && (*e != 0)) break;
       if(e == line.c_str()) break;
+      // strtoll() honours a leading sign even in base 16, so a chunk header
+      // of "-1" parses cleanly and leaves a negative size. That was then
+      // passed to read(), where it compared as smaller than the amount
+      // buffered and reached memcpy() as a very large size_t.
+      if(chunk_size_ < 0) break;
       if(chunk_size_ == 0) {
         chunked_ = CHUNKED_EOF;
       } else {

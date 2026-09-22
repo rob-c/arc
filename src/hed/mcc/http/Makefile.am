@@ -29,3 +29,15 @@ http_test_withtls_LDADD = \
 	$(top_builddir)/src/hed/libs/loader/libarcloader.la \
 	$(top_builddir)/src/hed/libs/common/libarccommon.la \
 	$(LIBXML2_LIBS) $(OPENSSL_LIBS)
+
+TESTS = PayloadHTTPChunkedTest
+check_PROGRAMS = $(TESTS)
+
+PayloadHTTPChunkedTest_SOURCES = $(top_srcdir)/src/Test.cpp PayloadHTTPChunkedTest.cpp PayloadHTTP.cpp
+PayloadHTTPChunkedTest_CXXFLAGS = -I$(top_srcdir)/include \
+	$(CPPUNIT_CFLAGS) $(GLIBMM_CFLAGS) $(LIBXML2_CFLAGS) $(AM_CXXFLAGS)
+PayloadHTTPChunkedTest_LDADD = \
+	$(top_builddir)/src/hed/libs/message/libarcmessage.la \
+	$(top_builddir)/src/hed/libs/loader/libarcloader.la \
+	$(top_builddir)/src/hed/libs/common/libarccommon.la \
+	$(CPPUNIT_LIBS) $(GLIBMM_LIBS) $(LIBXML2_LIBS)

@@ -18,6 +18,12 @@ namespace ArcMCCTLS {
 
 using namespace Arc;
 
+// Upper bound on a GSI token length read off the wire. Tokens carry handshake
+// data and wrapped SSL records, which stay far below this, so a larger value
+// means the length prefix has been corrupted rather than that a bigger token
+// is genuinely in flight.
+static const unsigned int max_token_size = 16*1024*1024;
+
 
 class BIOGSIMCC {
   private:
@@ -31,6 +37,7 @@ class BIOGSIMCC {
   public:
     BIOGSIMCC(MCCInterface* next):result_(STATUS_OK) {
       next_=NULL; stream_=NULL;
+      header_=4; token_=0;
       bio_ = NULL;
       if(MakeMethod()) {
         bio_ = BIO_new(biom_);
@@ -42,6 +49,7 @@ class BIOGSIMCC {
     };
     BIOGSIMCC(PayloadStreamInterface* stream):result_(STATUS_OK) {
       next_=NULL; stream_=NULL;
+      header_=4; token_=0;
       bio_ = NULL;
       if(MakeMethod()) {
         bio_ = BIO_new(biom_);
@@ -60,10 +68,12 @@ class BIOGSIMCC {
     void Stream(PayloadStreamInterface* stream) { stream_=stream; /*free ??*/ };
     MCCInterface* Next(void) const { return next_; };
     void MCC(MCCInterface* next) { next_=next; };
-    int Header(void) const { return header_; };
-    void Header(int v) { header_=v; };
-    int Token(void) const { return token_; };
-    void Token(int v) { token_=v; };
+    // Kept unsigned end to end: these hold a length taken off the wire, and
+    // returning it as int made a token of 2GiB or more read back negative.
+    unsigned int Header(void) const { return header_; };
+    void Header(unsigned int v) { header_=v; };
+    unsigned int Token(void) const { return token_; };
+    void Token(unsigned int v) { token_=v; };
     const MCC_Status& Result(void) { return result_; };
   private:
     static int  mcc_write(BIO *h, const char *buf, int num);
@@ -119,42 +129,58 @@ int BIOGSIMCC::mcc_read(BIO *b, char *out,int outl) {
   int ret=0;
   if (out == NULL) return(ret);
   if(b == NULL) return(ret);
+  // Nothing can be delivered into an empty buffer, and a negative size would
+  // otherwise be carried into the length arithmetic below.
+  if(outl <= 0) return(ret);
   BIOGSIMCC* biomcc = (BIOGSIMCC*)(BIO_get_data(b));
   if(biomcc == NULL) return(ret);
   PayloadStreamInterface* stream = biomcc->Stream();
   if(stream == NULL) return ret;
-  bool r = true;
-  if(biomcc->Header()) {
-    unsigned char header[4];
-    int l = biomcc->Header();
-    r = stream->Get((char*)(header+(4-l)),l);
-    if(r) {
-      for(int n = (4-biomcc->Header());n<(4-biomcc->Header()+l);++n) {
-        biomcc->Token(biomcc->Token() | (header[n] << ((3-n)*8)));
-      };
-      biomcc->Header(biomcc->Header()-l);
-    };
-  };
-  if(r) {
-    if(biomcc->Header() == 0) {
-      if(biomcc->Token()) {
-        int l = biomcc->Token();
-        if(l > outl) l=outl;
-        r = stream->Get(out,l);
-        if(r) {
-          biomcc->Token(biomcc->Token() - l);
-          outl = l;
-        };
-      } else {
-        outl=0;
-      };
-      if(biomcc->Token() == 0) biomcc->Header(4);
-    };
-  };
   //clear_sys_error();
   BIO_clear_retry_flags(b);
-  if(r) { ret=outl; } else { ret=-1; };
-  return ret;
+  if(biomcc->Header()) {
+    unsigned char header[4];
+    // How much of the 4 byte length prefix is still outstanding. Clamped so
+    // that a corrupted counter can never index outside the local array.
+    unsigned int pending = biomcc->Header();
+    if(pending > sizeof(header)) pending = sizeof(header);
+    unsigned int const offset = sizeof(header) - pending;
+    int l = (int)pending;
+    if(!stream->Get((char*)(header+offset),l)) return -1;
+    // Get() reports how much it actually delivered, so only those bytes are
+    // folded into the length being assembled.
+    for(int n = (int)offset;n<(int)offset+l;++n) {
+      biomcc->Token(biomcc->Token() | (((unsigned int)header[n]) << ((3-n)*8)));
+    };
+    biomcc->Header(pending-(unsigned int)l);
+    if(biomcc->Header() != 0) {
+      // Only part of the length prefix has arrived, so no payload can be
+      // delivered on this call. Ask to be called again rather than falling
+      // through: the old code left outl at the caller's buffer size and
+      // reported that as the byte count, handing back whatever the buffer
+      // already held.
+      BIO_set_retry_read(b);
+      return -1;
+    };
+  };
+  unsigned int remaining = biomcc->Token();
+  if(remaining > max_token_size) {
+    // Not a size this code can ever legitimately be asked to read, so the
+    // stream is corrupted or hostile. Refuse it here rather than passing the
+    // value on: previously a prefix with the top bit set arrived as a
+    // negative int, skipped the clamp against outl, and reached read() as a
+    // huge size_t.
+    return -1;
+  };
+  int delivered = 0;
+  if(remaining) {
+    int l = (remaining > (unsigned int)outl)?outl:(int)remaining;
+    if(!stream->Get(out,l)) return -1;
+    biomcc->Token(remaining - (unsigned int)l);
+    delivered = l;
+  };
+  if(biomcc->Token() == 0) biomcc->Header(4);
+  return delivered;
 }
 
 int BIOGSIMCC::mcc_write(BIO *b, const char *in, int inl) {

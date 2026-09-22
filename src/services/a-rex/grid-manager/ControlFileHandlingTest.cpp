@@ -22,6 +22,7 @@ class ControlFileHandlingTest : public CppUnit::TestFixture {
   CPPUNIT_TEST(TestFinalCleanup);
   CPPUNIT_TEST(TestStatusUpdates);
   CPPUNIT_TEST(TestLocalID);
+  CPPUNIT_TEST(TestStateWriteMoves);
   CPPUNIT_TEST_SUITE_END();
 public:
   void setUp() {
@@ -40,6 +41,7 @@ public:
   void TestFinalCleanup();
   void TestStatusUpdates();
   void TestLocalID();
+  void TestStateWriteMoves();
 private:
   std::string root;
   ARex::GMConfig config;
@@ -228,6 +230,71 @@ void ControlFileHandlingTest::TestLocalID() {
     CPPUNIT_ASSERT_EQUAL(0, chmod(path.c_str(), 0000));
     CPPUNIT_ASSERT(handler.get_local_id(id).empty());
   }
+}
+
+void ControlFileHandlingTest::TestStateWriteMoves() {
+  const std::string id = "123456789001";
+  const char* const dirs[] = {"accepting", "processing", "restarting", "finished"};
+
+  // Count the directories holding a status file, and report the one found.
+  struct Located {
+    int count;
+    std::string dir;
+  };
+  auto locate = [&]() {
+    Located found = {0, ""};
+    struct stat st;
+    for (const char* dir : dirs) {
+      if (Arc::FileStat(root + "/" + dir + "/" + id + ".status", &st, false)) {
+        ++found.count;
+        found.dir = dir;
+      }
+    }
+    return found;
+  };
+
+  ARex::GMJob job(id, Arc::User(), "", ARex::JOB_STATE_ACCEPTED);
+
+  // A job whose status file location is not yet known - as after a restart -
+  // must still have stale copies cleared out of the other directories.
+  for (const char* dir : dirs)
+    CPPUNIT_ASSERT(Arc::FileCreate(root + "/" + dir + "/" + id + ".status", "INLRMS"));
+  CPPUNIT_ASSERT(ARex::job_state_write_file(job, config, ARex::JOB_STATE_ACCEPTED, false));
+  Located found = locate();
+  CPPUNIT_ASSERT_EQUAL(1, found.count);
+  CPPUNIT_ASSERT_EQUAL(std::string("accepting"), found.dir);
+
+  // States that share the "processing" directory must not move the file, and
+  // must leave no copy behind in any other directory.
+  const ARex::job_state_t processing[] = {
+    ARex::JOB_STATE_PREPARING, ARex::JOB_STATE_SUBMITTING,
+    ARex::JOB_STATE_INLRMS, ARex::JOB_STATE_FINISHING
+  };
+  for (ARex::job_state_t state : processing) {
+    CPPUNIT_ASSERT(ARex::job_state_write_file(job, config, state, false));
+    found = locate();
+    CPPUNIT_ASSERT_EQUAL(1, found.count);
+    CPPUNIT_ASSERT_EQUAL(std::string("processing"), found.dir);
+    bool pending = false;
+    CPPUNIT_ASSERT(ARex::job_state_read_file(id, config, pending) == state);
+    CPPUNIT_ASSERT(!pending);
+  }
+
+  // Reaching a terminal state moves the file to "finished" and leaves exactly
+  // one copy, so a concurrent reader can never observe the job as missing.
+  CPPUNIT_ASSERT(ARex::job_state_write_file(job, config, ARex::JOB_STATE_FINISHED, true));
+  found = locate();
+  CPPUNIT_ASSERT_EQUAL(1, found.count);
+  CPPUNIT_ASSERT_EQUAL(std::string("finished"), found.dir);
+  bool pending = false;
+  CPPUNIT_ASSERT(ARex::job_state_read_file(id, config, pending) == ARex::JOB_STATE_FINISHED);
+  CPPUNIT_ASSERT(pending);
+
+  // Moving back out of a terminal state is handled the same way.
+  CPPUNIT_ASSERT(ARex::job_state_write_file(job, config, ARex::JOB_STATE_PREPARING, false));
+  found = locate();
+  CPPUNIT_ASSERT_EQUAL(1, found.count);
+  CPPUNIT_ASSERT_EQUAL(std::string("processing"), found.dir);
 }
 
 CPPUNIT_TEST_SUITE_REGISTRATION(ControlFileHandlingTest);

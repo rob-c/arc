@@ -65,6 +65,7 @@ void GMJob::set_share(std::string share) {
 
 GMJob::GMJob(void) {
   job_state=JOB_STATE_UNDEFINED;
+  status_subdir=NULL;
   job_pending=false;
   keep_finished=-1;
   keep_deleted=-1;
@@ -77,6 +78,7 @@ GMJob::GMJob(void) {
 
 GMJob::GMJob(const JobId &id,const Arc::User& u,const std::string &dir,job_state_t state) {
   job_state=state;
+  status_subdir=NULL;
   job_pending=false;
   job_id=id;
   session_dir=dir;

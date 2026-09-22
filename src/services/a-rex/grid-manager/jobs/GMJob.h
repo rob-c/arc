@@ -69,6 +69,12 @@ class GMJob {
   std::string transfer_share;
   // Start time of job i.e. when it first moves to PREPARING
   time_t start_time;
+  // Subdirectory of the control directory which currently holds this job's
+  // status file, or NULL while that is not known - for example for a job
+  // picked up after a restart. This records where the file physically sits
+  // rather than any property of the job, and is updated while writing the
+  // status file, so it is mutable and does not affect logical constness.
+  mutable const char* status_subdir;
 
   struct job_state_rec_t {
     const char* name;
@@ -123,6 +129,12 @@ class GMJob {
   static char get_state_mail_flag(job_state_t st);
   static job_state_t get_state(const char* state);
   const JobId& get_id() const { return job_id; };
+  /// Subdirectory of the control directory last known to hold this job's
+  /// status file, or NULL if that is not known.
+  const char* get_status_subdir() const { return status_subdir; };
+  /// Record which subdirectory now holds this job's status file. Passing
+  /// NULL marks the location as unknown again.
+  void set_status_subdir(const char* subdir) const { status_subdir = subdir; };
   std::string SessionDir(void) const { return session_dir; };
   void AddFailure(const std::string &reason) { failure_reason+=reason; failure_reason+="\n"; };
   /// Retrieve current failure reason (both in memory and stored in control dir).

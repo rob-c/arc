@@ -3,6 +3,7 @@
 #endif
 
 #include <sstream>
+#include <cstring>
 #include <fcntl.h>
 #include <errno.h>
 
@@ -460,25 +461,51 @@ job_state_t job_state_read_file(const JobId &id,const GMConfig &config,bool& pen
   return job_state_read_file(fname,pending);
 }
 
+// Which control directory subdirectory holds the status file of a job in
+// the given state.
+static const char* job_state_subdir(job_state_t state) {
+  if(state == JOB_STATE_ACCEPTED) return subdir_new;
+  if((state == JOB_STATE_FINISHED) || (state == JOB_STATE_DELETED)) return subdir_old;
+  return subdir_cur;
+}
+
 bool job_state_write_file(const GMJob &job,const GMConfig &config,job_state_t state,bool pending) {
-  std::string fname;
-  if(state == JOB_STATE_ACCEPTED) { 
-    fname = config.ControlDir() + "/" + subdir_old + "/" + job.get_id() + "." + sfx_status; remove(fname.c_str());
-    fname = config.ControlDir() + "/" + subdir_cur + "/" + job.get_id() + "." + sfx_status; remove(fname.c_str());
-    fname = config.ControlDir() + "/" + subdir_rew + "/" + job.get_id() + "." + sfx_status; remove(fname.c_str());
-    fname = config.ControlDir() + "/" + subdir_new + "/" + job.get_id() + "." + sfx_status;
-  } else if((state == JOB_STATE_FINISHED) || (state == JOB_STATE_DELETED)) {
-    fname = config.ControlDir() + "/" + subdir_new + "/" + job.get_id() + "." + sfx_status; remove(fname.c_str());
-    fname = config.ControlDir() + "/" + subdir_cur + "/" + job.get_id() + "." + sfx_status; remove(fname.c_str());
-    fname = config.ControlDir() + "/" + subdir_rew + "/" + job.get_id() + "." + sfx_status; remove(fname.c_str());
-    fname = config.ControlDir() + "/" + subdir_old + "/" + job.get_id() + "." + sfx_status;
+  char const * const target = job_state_subdir(state);
+  std::string const prefix = config.ControlDir() + "/";
+  std::string const suffix = std::string("/") + job.get_id() + "." + sfx_status;
+  std::string const fname = prefix + target + suffix;
+
+  // Write the new status first. job_state_write_file() below goes through
+  // Arc::FileCreate(), which stages a temporary file and renames it into
+  // place, so the status file is replaced atomically.
+  if(!job_state_write_file(fname,state,pending)) return false;
+  if(!fix_file_owner(fname,job)) return false;
+  if(!fix_file_permissions(fname,job,config)) return false;
+
+  // Only once the new status is in place, drop the copy left behind in
+  // whichever directory held it before. Removing first would leave a window
+  // with no status file in any directory, and job_state_read_file() reports
+  // a missing file as JOB_STATE_DELETED - so a concurrent scan could decide
+  // a live job had disappeared. Writing first means the file is always
+  // present somewhere; the worst a reader can see is the previous state,
+  // which it re-reads on its next pass.
+  char const * const previous = job.get_status_subdir();
+  if(previous != NULL) {
+    // Location is known, so only one removal can be needed.
+    if(std::strcmp(previous, target) != 0)
+      remove((prefix + previous + suffix).c_str());
   } else {
-    fname = config.ControlDir() + "/" + subdir_new + "/" + job.get_id() + "." + sfx_status; remove(fname.c_str());
-    fname = config.ControlDir() + "/" + subdir_old + "/" + job.get_id() + "." + sfx_status; remove(fname.c_str());
-    fname = config.ControlDir() + "/" + subdir_rew + "/" + job.get_id() + "." + sfx_status; remove(fname.c_str());
-    fname = config.ControlDir() + "/" + subdir_cur + "/" + job.get_id() + "." + sfx_status;
-  };
-  return job_state_write_file(fname,state,pending) && fix_file_owner(fname,job) && fix_file_permissions(fname,job,config);
+    // Location unknown, for instance for a job picked up after a restart.
+    // Sweep the other directories once; subsequent writes take the cheap
+    // path above.
+    char const * const others[] = { subdir_new, subdir_cur, subdir_old, subdir_rew };
+    for(size_t n = 0; n < sizeof(others)/sizeof(others[0]); ++n) {
+      if(std::strcmp(others[n], target) != 0)
+        remove((prefix + others[n] + suffix).c_str());
+    }
+  }
+  job.set_status_subdir(target);
+  return true;
 }
 
 static job_state_t job_state_read_file(const std::string &fname,bool &pending) {

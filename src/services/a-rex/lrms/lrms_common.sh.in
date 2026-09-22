@@ -29,25 +29,37 @@ parse_arc_conf () {
   # [queue] section is relevant to fetch per-queue memory limits, benchmarks and customizations
   queue_options="defaultmemory benchmark $queue_options"
 
-  # define blocks to loop over
-  blocks="common arex lrms"
-  if [ -n "$joboption_queue" ]; then
-    blocks="$blocks queue:$joboption_queue"
-  fi
-
-  for block in $blocks; do 
-    # construct options filter for block
-    eval "block_options=\${${block%%:*}_options}"
-    optfilter=""
+  # Starting the config parser dominates the cost of a submission: it is
+  # Python, and the interpreter start outweighs the parse itself. It accepts
+  # several blocks in one call, so read together the ones that can be.
+  #
+  # common, arex and lrms name disjoint options, so reading them in one call
+  # gives the same values as reading them in turn. The queue block cannot
+  # join them: it deliberately repeats options from lrms, such as benchmark
+  # and defaultmemory, so that a queue can override them, and that precedence
+  # only holds when it is read afterwards in a call of its own.
+  blockargs=""
+  optfilter=""
+  for block in common arex lrms; do
+    blockargs="$blockargs -b $block"
+    eval "block_options=\${${block}_options}"
     for opt in $block_options; do
       optfilter="$optfilter -f $opt"
     done
-    # parse options (assumes runconfig comes from a-rex)
-    eval $( $pkglibexecdir/arcconfig-parser --load -r ${ARC_CONFIG} --export bash -b $block $optfilter )
   done
-  
+  # parse options (assumes runconfig comes from a-rex)
+  eval $( $pkglibexecdir/arcconfig-parser --load -r ${ARC_CONFIG} --export bash $blockargs $optfilter )
+
+  if [ -n "$joboption_queue" ]; then
+    optfilter=""
+    for opt in $queue_options; do
+      optfilter="$optfilter -f $opt"
+    done
+    eval $( $pkglibexecdir/arcconfig-parser --load -r ${ARC_CONFIG} --export bash -b "queue:$joboption_queue" $optfilter )
+  fi
+
   # cleanup env
-  unset opt optfilter block blocks arex_options common_options
+  unset opt optfilter block blockargs block_options arex_options common_options
 }
 
 

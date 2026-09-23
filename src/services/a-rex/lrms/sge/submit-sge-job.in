@@ -531,11 +531,23 @@ echo "" >> $LRMS_JOB_SCRIPT
 cat >> "$LRMS_JOB_SCRIPT" <<'EOSCR'
 RUNTIME_DIRECTORY_READY=
 if [ "$RESULT" = '0' ]; then
-  if cd "$RUNTIME_JOB_DIR"; then
-    HOME=$RUNTIME_JOB_DIR
-    export HOME
-    RUNTIME_DIRECTORY_READY=yes
-  else
+  # Retried rather than attempted once. The session directory lives on shared
+  # storage reached over the cluster network, and the failures this guards
+  # against are brief: the directory is there, the node momentarily cannot see
+  # it. Giving up on the first attempt turns a blip lasting seconds into a
+  # failed job, so wait a little and ask again before concluding it is gone.
+  arc_cd_attempt=1
+  while [ "$arc_cd_attempt" -le 6 ]; do
+    if cd "$RUNTIME_JOB_DIR" 2>/dev/null; then
+      HOME=$RUNTIME_JOB_DIR
+      export HOME
+      RUNTIME_DIRECTORY_READY=yes
+      break
+    fi
+    arc_cd_attempt=$(( arc_cd_attempt + 1 ))
+    sleep 5
+  done
+  if [ -z "$RUNTIME_DIRECTORY_READY" ]; then
     echo "Failed to switch to '$RUNTIME_JOB_DIR'" 1>&2
     RESULT=1
   fi
@@ -665,7 +677,15 @@ qsub_workdir=`mktemp -d "${TMPDIR}/sge-qsub.XXXXXX"` || {
   # Grid Engine initially records getcwd() under this spool key and later
   # publishes it as SGE_O_WORKDIR. Override the same key after initialization
   # so PE start/stop procedures also see the ARC session, not this directory.
-  "$sge_qsub" -terse -b n -shell y -C '#$' -wd "$joboption_directory" \
+  # -wd is deliberately a node local directory. Grid Engine's shepherd chdirs
+  # into it before the job starts, so naming the session directory here made
+  # every job start depend on shared storage answering at that instant; when it
+  # did not, the job died with 'failed 28 : changing into working directory'
+  # and stuck in Eqw, which '-r n' above means is permanent. The job script
+  # does its own cd into the session directory a few lines in, where a failure
+  # is an ordinary job failure A-REX can see and rerun, and SGE_O_WORKDIR is
+  # exported explicitly, so nothing depends on the shepherd's chdir.
+  "$sge_qsub" -terse -b n -shell y -C '#$' -wd /tmp \
     -v "__SGE_PREFIX__O_WORKDIR=$joboption_directory" \
     -S '@posix_shell@' "$LRMS_JOB_SCRIPT"
 ) >"$LRMS_JOB_OUT" 2>"$LRMS_JOB_ERR"

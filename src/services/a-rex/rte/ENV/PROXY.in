@@ -64,9 +64,25 @@ if [ "x$1" = "x0" ]; then
                 fi
             fi
         fi
+        if [ -z "${cacert_staged}" ] && [ "x$CACERT_TAR" = "xYes" ]; then
+            # The cache could not be built or read - a read-only control
+            # directory, say. Pack straight into the session directory rather
+            # than falling through to the copy: move_files_to_node carries
+            # regular files and skips directories, so on a site using node
+            # local scratch the copied directory never arrives and the job
+            # runs with an empty X509_CERT_DIR. Slower than reusing the cache,
+            # but it still reaches the worker node.
+            if tar cf "${joboption_directory}/certificates.tar" \
+                   -C "${X509_CERT_DIR}" . 2>/dev/null; then
+                chown --reference="${joboption_directory}" \
+                      "${joboption_directory}/certificates.tar" 2>/dev/null
+                cacert_staged=tar
+            else
+                rm -f "${joboption_directory}/certificates.tar"
+            fi
+        fi
         if [ -z "${cacert_staged}" ]; then
-            # Archive disabled, or it could not be built - for instance where
-            # the control directory is read-only. Fall back to the copy.
+            # CACERT_TAR=No, or tar is unavailable entirely.
             mkdir -pv ${joboption_directory}/arc/certificates/
             cp -rv ${X509_CERT_DIR}/* ${joboption_directory}/arc/certificates/
             # Same reasoning as the archive above.

@@ -86,8 +86,23 @@ echo "#$ -r n" >> "$LRMS_JOB_SCRIPT"
 echo "#$ -m n" >> "$LRMS_JOB_SCRIPT"
 # Mix standard output and standard error:
 echo "#$ -j y" >> "$LRMS_JOB_SCRIPT"
-# Write output to comment file:
-echo "#$ -o ${joboption_directory}/.comment" >> "$LRMS_JOB_SCRIPT"
+# Node local path for the job's own output. $JOB_ID is expanded by Grid
+# Engine, so each job gets its own file and they never collide.
+sge_comment_local='/tmp/arc-comment.$JOB_ID'
+
+# Write output to comment file.
+#
+# Grid Engine's shepherd opens this before the job starts, so naming a path on
+# the session directory makes startup depend on that storage answering at that
+# instant. A transient network problem there does not delay the job, it kills
+# it: the job lands in Eqw and stays until someone clears it by hand, and the
+# '-r n' above means Grid Engine will not retry it either. Observed on this
+# site with jobs that were identical in every other respect.
+#
+# Collect it on the execution node instead and copy it back from inside the
+# job, where the copy can be retried and a failure costs the diagnostic output
+# rather than the job.
+echo "#\$ -o ${sge_comment_local}" >> "$LRMS_JOB_SCRIPT"
 
 ##############################################################
 # priority
@@ -399,6 +414,38 @@ fi
 # file. Preserve the conventional submit-directory value for RTEs and jobs.
 echo "SGE_O_WORKDIR=$joboption_directory" >> "$LRMS_JOB_SCRIPT"
 echo "export SGE_O_WORKDIR" >> "$LRMS_JOB_SCRIPT"
+
+# Bring the node local comment file back to the session directory when the job
+# script exits, whatever way it exits.
+#
+# This is a trap rather than a copy at the end of the script for two reasons.
+# It runs on every exit path, including the ones that leave the session
+# directory unusable, so the node local file is always cleaned up instead of
+# being left on the execution node. And it runs last, so it captures the
+# script's diagnostics right up to the end - a copy placed inline would lose
+# everything logged after it, which is precisely the file movement output that
+# is worth having when something has gone wrong.
+#
+# The copy is retried because the transient shared filesystem trouble this
+# whole change guards against is most likely to be happening exactly now. It is
+# allowed to fail: losing the comment file costs diagnostics, not the job, and
+# unlike Grid Engine's shepherd opening the file before the job starts, nothing
+# here can put the job into Eqw.
+cat >> "$LRMS_JOB_SCRIPT" <<EOSCR
+sge_comment_local="${sge_comment_local}"
+sge_comment_save() {
+  if [ -f "\$sge_comment_local" ]; then
+    sge_copy_attempt=1
+    while [ "\$sge_copy_attempt" -le 5 ]; do
+      cp "\$sge_comment_local" "${joboption_directory}/.comment" 2>/dev/null && break
+      sge_copy_attempt=\$(( sge_copy_attempt + 1 ))
+      sleep 3
+    done
+    rm -f "\$sge_comment_local"
+  fi
+}
+trap sge_comment_save EXIT
+EOSCR
 
 ##############################################################
 # Override umask

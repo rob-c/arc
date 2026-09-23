@@ -173,7 +173,11 @@ assert_grep 'the terse job ID is persisted in GRAMi' '^joboption_jobid=73001$' "
 assert_grep 'submission epoch is persisted for accounting identity' '^joboption_sge_submit_time=[0-9]+$' "$TEST_ROOT/success.grami"
 assert_grep 'unique native job name is persisted for live identity' \
     '^joboption_sge_job_name=arc_SGE_regression_arcjob$' "$TEST_ROOT/success.grami"
-runtime_cd_line=`sed -n '/^  if cd "\$RUNTIME_JOB_DIR"; then$/{=;q;}' "$TEST_ROOT/submitted.job"`
+# Matched on what the generated script does rather than on how it is laid
+# out. These asserted an exact line, indentation included, so retrying the
+# chdir broke them although the ordering they exist to protect was intact.
+runtime_cd_line=`sed -n '/cd "\$RUNTIME_JOB_DIR"/{=;q;}' "$TEST_ROOT/submitted.job"`
+runtime_home_line=`sed -n '/^[[:space:]]*HOME=\$RUNTIME_JOB_DIR$/{=;q;}' "$TEST_ROOT/submitted.job"`
 rte_stage1_line=`sed -n '/^# TEST_RTE_STAGE1$/{=;q;}' "$TEST_ROOT/submitted.job"`
 if [ -n "$runtime_cd_line" ] && [ -n "$rte_stage1_line" ] \
     && [ "$runtime_cd_line" -lt "$rte_stage1_line" ]; then
@@ -181,8 +185,12 @@ if [ -n "$runtime_cd_line" ] && [ -n "$rte_stage1_line" ] \
 else
     not_ok 'stage-one runtime hooks run after entering the effective runtime directory'
 fi
-assert_grep 'the runtime directory becomes HOME before stage one' \
-    '^    HOME=\$RUNTIME_JOB_DIR$' "$TEST_ROOT/submitted.job"
+if [ -n "$runtime_home_line" ] && [ -n "$rte_stage1_line" ] \
+    && [ "$runtime_home_line" -lt "$rte_stage1_line" ]; then
+    ok 'the runtime directory becomes HOME before stage one'
+else
+    not_ok 'the runtime directory becomes HOME before stage one'
+fi
 assert_grep 'the generated workload preserves the conventional submit directory' \
     '^SGE_O_WORKDIR=.*/session$' "$TEST_ROOT/submitted.job"
 assert_grep 'the conventional submit directory is exported for the workload' \

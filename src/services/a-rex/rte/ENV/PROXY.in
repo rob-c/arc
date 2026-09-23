@@ -45,8 +45,13 @@ if [ "x$1" = "x0" ]; then
                 fi
             fi
             if [ -f "${cacert_tar}" ]; then
-                mkdir -p "${joboption_directory}/arc"
-                cp "${cacert_tar}" "${joboption_directory}/arc/certificates.tar" && cacert_staged=tar
+                # Staged at the top of the session directory rather than under
+                # arc/. Where the job runs from node local scratch, A-REX moves
+                # the session across with a loop that skips anything which is
+                # not a regular file, so a subdirectory never arrives - which
+                # is why copying the CA directory in left the job with an empty
+                # X509_CERT_DIR. A single file survives that move.
+                cp "${cacert_tar}" "${joboption_directory}/certificates.tar" && cacert_staged=tar
             fi
         fi
         if [ -z "${cacert_staged}" ]; then
@@ -74,11 +79,13 @@ elif [ "x$1" = "x1" ]; then
         # are cancelled or never scheduled never pay for it. Staging by copy
         # is still handled, so a job submitted before this RTE changed, or by
         # a site with CACERT_TAR=No, keeps working.
-        if [ -f "${RUNTIME_JOB_DIR}/arc/certificates.tar" ]; then
+        for cacert_archive in "${RUNTIME_JOB_DIR}/certificates.tar" \
+                              "${RUNTIME_JOB_DIR}/arc/certificates.tar"; do
+            [ -f "${cacert_archive}" ] || continue
             mkdir -p "${RUNTIME_JOB_DIR}/arc/certificates"
-            tar xf "${RUNTIME_JOB_DIR}/arc/certificates.tar" \
-                -C "${RUNTIME_JOB_DIR}/arc/certificates" 2>/dev/null
-        fi
+            tar xf "${cacert_archive}" -C "${RUNTIME_JOB_DIR}/arc/certificates" 2>/dev/null
+            break
+        done
         export X509_CERT_DIR="${RUNTIME_JOB_DIR}/arc/certificates"
     else
         export X509_CERT_DIR="${X509_CERT_DIR:-/etc/grid-security/certificates}"
@@ -86,6 +93,6 @@ elif [ "x$1" = "x1" ]; then
 elif [ "x$1" = "x2" ]; then
     if [ "x$COPY_CACERT_DIR" = "xYes" ]; then
         rm -rf ${RUNTIME_JOB_DIR}/arc/certificates
-        rm -f ${RUNTIME_JOB_DIR}/arc/certificates.tar
+        rm -f ${RUNTIME_JOB_DIR}/certificates.tar ${RUNTIME_JOB_DIR}/arc/certificates.tar
     fi
 fi

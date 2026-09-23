@@ -51,12 +51,13 @@ if [ "x$1" = "x0" ]; then
                 # not a regular file, so a subdirectory never arrives - which
                 # is why copying the CA directory in left the job with an empty
                 # X509_CERT_DIR. A single file survives that move.
-                # Owned by whoever owns the session directory, not by the user
-                # running this stage. A-REX runs it as root while the job runs
-                # as the mapped user, and a site that copies the session
-                # directory about as that user cannot preserve root's ownership:
-                # rsync -a reports 'chgrp ... Operation not permitted' and exits
-                # 23, which fails the job. Nothing here needs root ownership.
+                # Owned by whoever owns the session directory. A-REX normally runs
+                # this stage as the mapped user already, so this is usually a
+                # no-op. It matters where the stage runs as someone else: a site
+                # that copies the session directory as the job user cannot then
+                # preserve another owner, and rsync -a reports 'chgrp ...
+                # Operation not permitted' and exits 23. Not being permitted to
+                # chown is not fatal - the archive is staged either way.
                 if cp "${cacert_tar}" "${joboption_directory}/certificates.tar"; then
                     chown --reference="${joboption_directory}" \
                           "${joboption_directory}/certificates.tar" 2>/dev/null

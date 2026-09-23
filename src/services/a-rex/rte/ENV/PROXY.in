@@ -51,7 +51,17 @@ if [ "x$1" = "x0" ]; then
                 # not a regular file, so a subdirectory never arrives - which
                 # is why copying the CA directory in left the job with an empty
                 # X509_CERT_DIR. A single file survives that move.
-                cp "${cacert_tar}" "${joboption_directory}/certificates.tar" && cacert_staged=tar
+                # Owned by whoever owns the session directory, not by the user
+                # running this stage. A-REX runs it as root while the job runs
+                # as the mapped user, and a site that copies the session
+                # directory about as that user cannot preserve root's ownership:
+                # rsync -a reports 'chgrp ... Operation not permitted' and exits
+                # 23, which fails the job. Nothing here needs root ownership.
+                if cp "${cacert_tar}" "${joboption_directory}/certificates.tar"; then
+                    chown --reference="${joboption_directory}" \
+                          "${joboption_directory}/certificates.tar" 2>/dev/null
+                    cacert_staged=tar
+                fi
             fi
         fi
         if [ -z "${cacert_staged}" ]; then
@@ -59,6 +69,9 @@ if [ "x$1" = "x0" ]; then
             # the control directory is read-only. Fall back to the copy.
             mkdir -pv ${joboption_directory}/arc/certificates/
             cp -rv ${X509_CERT_DIR}/* ${joboption_directory}/arc/certificates/
+            # Same reasoning as the archive above.
+            chown -R --reference="${joboption_directory}" \
+                  "${joboption_directory}/arc/certificates" 2>/dev/null
         fi
     fi
     if [ "x$USE_DELEGATION_DB" = "xYes" ]; then
@@ -84,6 +97,10 @@ elif [ "x$1" = "x1" ]; then
             [ -f "${cacert_archive}" ] || continue
             mkdir -p "${RUNTIME_JOB_DIR}/arc/certificates"
             tar xf "${cacert_archive}" -C "${RUNTIME_JOB_DIR}/arc/certificates" 2>/dev/null
+            # Once unpacked the archive is dead weight, and a site that copies
+            # the job directory back to shared storage would otherwise carry
+            # every megabyte of it home again.
+            rm -f "${cacert_archive}"
             break
         done
         export X509_CERT_DIR="${RUNTIME_JOB_DIR}/arc/certificates"

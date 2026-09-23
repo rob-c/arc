@@ -1,7 +1,7 @@
 # description: copy proxy certificate to the job session directory
 # param:COPY_CACERT_DIR:Yes,No:Yes:If set to Yes, CA certificate dir will be copied to the session directory along with proxy certificate
 # param:CACERT_TAR:Yes,No:Yes:If set to Yes the CA certificate dir is staged as a single archive and unpacked on the worker node instead of being copied file by file
-# param:CACERT_TAR_CACHE:string::Path of the generated CA archive (default: <controldir>/ca-certificates.tar)
+# param:CACERT_TAR_CACHE:string::Path of the reusable CA archive (default: <controldir>/ca-certificates.tar). Jobs build it only where its directory is writable by their mapped account; otherwise it is reused only when owned by root and writable by nobody else, e.g. refreshed as root with "sh <this RTE> cache" from cron or a fetch-crl hook
 # param:USE_DELEGATION_DB:Yes,No:No:If set to Yes RTE will try to extract proxy certificate from A-REX delegation DB (works in limited number of cases)
 # param:X509_CERT_DIR:string:/etc/pki/tls/certs:CAdir to use (either /etc/grid-security/certificates or system folder depending on x509_cert_policy grid or system)
 
@@ -10,76 +10,126 @@ CACERT_TAR="${CACERT_TAR:-Yes}"
 USE_DELEGATION_DB="${USE_DELEGATION_DB:-No}"
 X509_CERT_DIR="${X509_CERT_DIR:-/etc/grid-security/certificates}"
 
+# Pack the CA directory into the archive $1. Only symlinks and world-readable
+# entries go in. Stage 0 runs as the job's mapped account, which cannot read
+# anything else, and a single unreadable file - arcctl test-ca keeps the CA's
+# private key here with mode 0400 - made tar fail the whole archive. Selecting
+# by permission rather than by what this account happens to be able to read
+# also keeps such a key out of an archive packed as root, which every job
+# would otherwise carry to its worker node.
+cacert_pack () {
+    ( cd "${X509_CERT_DIR}" && \
+      find . -mindepth 1 \( -type l -o -perm -0004 \) -print0 | \
+          tar cf "$1" --null --no-recursion -T - ) 2>/dev/null
+}
 
-if [ "x$1" = "x0" ]; then
+# True when something in the CA directory is newer than the archive $1. find
+# stops at the first newer entry, so an unchanged directory costs a local scan
+# rather than a repack.
+cacert_stale () {
+    [ -n "$(find "${X509_CERT_DIR}/" -newer "$1" -print -quit 2>/dev/null)" ]
+}
+
+# Build the archive $1 unless it is already up to date. Published atomically:
+# a concurrent submission sees either the previous archive or this one, never
+# a partial file. Readable by all, as the certificates in it already are.
+cacert_refresh () {
+    if [ -f "$1" ] && ! cacert_stale "$1"; then
+        return 0
+    fi
+    cacert_tmp=$(mktemp "$1.XXXXXX" 2>/dev/null) || return 1
+    if cacert_pack "${cacert_tmp}" && chmod 644 "${cacert_tmp}" && \
+       mv -f "${cacert_tmp}" "$1"; then
+        return 0
+    fi
+    rm -f "${cacert_tmp}"
+    return 1
+}
+
+# The archive is the set of trust anchors the job will use, so reuse one only
+# if nobody but root or the account running this could have written or
+# replaced it: the file and its directory each owned by one of those, and
+# writable by neither group nor others.
+cacert_trusted () {
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    for cacert_path in "$1" "$(dirname "$1")"; do
+        cacert_stat=$(stat -c '%u %a' "${cacert_path}" 2>/dev/null) || return 1
+        case "${cacert_stat%% *}" in
+            0|"$(id -u)") ;;
+            *) return 1 ;;
+        esac
+        [ $(( 0${cacert_stat#* } & 022 )) -eq 0 ] || return 1
+    done
+}
+
+if [ "x$1" = "xcache" ]; then
+    # Refresh the reusable archive out of band. Jobs run stage 0 as their
+    # mapped account, which cannot write A-REX's control directory, so on a
+    # default installation they only ever reuse this archive and it has to be
+    # built by its owner - root, from cron or a fetch-crl hook:
+    #   CONFIG_controldir=/var/spool/arc/jobstatus sh .../rte/ENV/PROXY cache
+    cacert_refresh "${CACERT_TAR_CACHE:-${CONFIG_controldir:?set CACERT_TAR_CACHE or CONFIG_controldir}/ca-certificates.tar}"
+elif [ "x$1" = "x0" ]; then
 
     PROXY_FILE=$(control_path "${joboption_controldir}" "${joboption_gridid}" "proxy")
 
     if [ "x$COPY_CACERT_DIR" = "xYes" ]; then
         cacert_staged=
-        if [ "x$CACERT_TAR" = "xYes" ] && [ -n "${CACERT_TAR_CACHE:-${CONFIG_controldir}}" ]; then
+        if [ "x$CACERT_TAR" = "xYes" ]; then
             # Stage the CA directory as one file rather than as its contents.
             # A CA directory is on the order of a thousand small files, and
             # copying them individually costs that many metadata operations on
             # the session filesystem for every job, before the job has even
-            # been queued. The archive is built once and reused until the CA
-            # directory changes, and is only unpacked if the job actually
+            # been queued. The archive is only unpacked if the job actually
             # starts running (stage 1).
+            #
+            # Staged at the top of the session directory rather than under
+            # arc/. Where the job runs from node local scratch, A-REX moves
+            # the session across with a loop that skips anything which is
+            # not a regular file, so a subdirectory never arrives - which
+            # is why copying the CA directory in left the job with an empty
+            # X509_CERT_DIR. A single file survives that move.
+            #
+            # Owned by whoever owns the session directory. A-REX normally runs
+            # this stage as the mapped user already, so this is usually a
+            # no-op. It matters where the stage runs as someone else: a site
+            # that copies the session directory as the job user cannot then
+            # preserve another owner, and rsync -a reports 'chgrp ...
+            # Operation not permitted' and exits 23. Not being permitted to
+            # chown is not fatal - the archive is staged either way.
+            #
             # CONFIG_controldir, not joboption_controldir: the latter is the
             # directory holding this job's grami file and goes away with the
             # job, which would mean rebuilding the archive for every
             # submission instead of reusing it.
-            cacert_tar="${CACERT_TAR_CACHE:-${CONFIG_controldir}/ca-certificates.tar}"
-            # Rebuild when anything in the CA directory is newer than the
-            # archive. find stops at the first newer entry, so an unchanged
-            # directory costs a local scan rather than a repack.
-            if [ ! -f "${cacert_tar}" ] || \
-               [ -n "$(find "${X509_CERT_DIR}/" -newer "${cacert_tar}" -print -quit 2>/dev/null)" ]; then
-                cacert_tmp="${cacert_tar}.$$"
-                if tar cf "${cacert_tmp}" -C "${X509_CERT_DIR}" . 2>/dev/null; then
-                    # Published atomically: a concurrent submission either sees
-                    # the previous archive or this one, never a partial file.
-                    mv -f "${cacert_tmp}" "${cacert_tar}" 2>/dev/null || rm -f "${cacert_tmp}"
-                else
-                    rm -f "${cacert_tmp}"
+            cacert_tar="${CACERT_TAR_CACHE:-${CONFIG_controldir:+${CONFIG_controldir}/ca-certificates.tar}}"
+            if [ -n "${cacert_tar}" ]; then
+                # Built here only where this account may write it. A-REX's
+                # control directory belongs to root while this stage runs as
+                # the mapped account, so by default the archive is reused but
+                # never built here; see the cache mode above.
+                if [ -w "$(dirname "${cacert_tar}")" ]; then
+                    cacert_refresh "${cacert_tar}"
                 fi
-            fi
-            if [ -f "${cacert_tar}" ]; then
-                # Staged at the top of the session directory rather than under
-                # arc/. Where the job runs from node local scratch, A-REX moves
-                # the session across with a loop that skips anything which is
-                # not a regular file, so a subdirectory never arrives - which
-                # is why copying the CA directory in left the job with an empty
-                # X509_CERT_DIR. A single file survives that move.
-                # Owned by whoever owns the session directory. A-REX normally runs
-                # this stage as the mapped user already, so this is usually a
-                # no-op. It matters where the stage runs as someone else: a site
-                # that copies the session directory as the job user cannot then
-                # preserve another owner, and rsync -a reports 'chgrp ...
-                # Operation not permitted' and exits 23. Not being permitted to
-                # chown is not fatal - the archive is staged either way.
-                if cp "${cacert_tar}" "${joboption_directory}/certificates.tar"; then
+                if cacert_trusted "${cacert_tar}" && ! cacert_stale "${cacert_tar}" && \
+                   cp "${cacert_tar}" "${joboption_directory}/certificates.tar"; then
                     chown --reference="${joboption_directory}" \
                           "${joboption_directory}/certificates.tar" 2>/dev/null
                     cacert_staged=tar
                 fi
             fi
-        fi
-        if [ -z "${cacert_staged}" ] && [ "x$CACERT_TAR" = "xYes" ]; then
-            # The cache could not be built or read - a read-only control
-            # directory, say. Pack straight into the session directory rather
-            # than falling through to the copy: move_files_to_node carries
-            # regular files and skips directories, so on a site using node
-            # local scratch the copied directory never arrives and the job
-            # runs with an empty X509_CERT_DIR. Slower than reusing the cache,
-            # but it still reaches the worker node.
-            if tar cf "${joboption_directory}/certificates.tar" \
-                   -C "${X509_CERT_DIR}" . 2>/dev/null; then
-                chown --reference="${joboption_directory}" \
-                      "${joboption_directory}/certificates.tar" 2>/dev/null
-                cacert_staged=tar
-            else
-                rm -f "${joboption_directory}/certificates.tar"
+            if [ -z "${cacert_staged}" ]; then
+                # No archive to reuse. Pack straight into the session directory
+                # rather than falling through to the copy below, which would
+                # not reach a worker node running from local scratch. Slower
+                # than reusing the archive, but the job still gets its CAs.
+                if cacert_pack "${joboption_directory}/certificates.tar"; then
+                    chown --reference="${joboption_directory}" \
+                          "${joboption_directory}/certificates.tar" 2>/dev/null
+                    cacert_staged=tar
+                else
+                    rm -f "${joboption_directory}/certificates.tar"
+                fi
             fi
         fi
         if [ -z "${cacert_staged}" ]; then

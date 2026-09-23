@@ -2,4 +2,8 @@ arcrteenvdir = $(pkgdatadir)/rte/ENV
 arcrteenv_DATA = ENV/PROXY ENV/RTE ENV/LRMS-SCRATCH ENV/CANDYPOND ENV/SINGULARITY
 arcrteenvcondordir = $(pkgdatadir)/rte/ENV/CONDOR
 arcrteenvcondor_DATA = ENV/CONDOR/DOCKER
-EXTRA_DIST = ENV/RTE ENV/LRMS-SCRATCH ENV/SINGULARITY $(arcrteenvcondor_DATA)
+EXTRA_DIST = ENV/RTE ENV/LRMS-SCRATCH ENV/SINGULARITY $(arcrteenvcondor_DATA) \
+             test-proxy-rte.sh
+
+TESTS = test-proxy-rte.sh
+TESTS_ENVIRONMENT = PROXY_RTE=$(builddir)/ENV/PROXY $(SHELL)

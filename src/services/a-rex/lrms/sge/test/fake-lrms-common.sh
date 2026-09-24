@@ -14,6 +14,8 @@ common_init () {
     CONFIG_sge_wakeupperiod=0
     CONFIG_sge_query_retries=0
     CONFIG_sge_accounting_retries=1
+    # Tests change scheduler answers between submissions; enable per test.
+    CONFIG_sge_config_cache_ttl=0
     perflogdir=
     time_hardlimit_ratio=2
     memory_hardlimit_ratio=2

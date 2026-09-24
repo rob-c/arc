@@ -61,6 +61,7 @@ my $lrms_options = {
     sge_wakeupperiod => '*',
     sge_query_retries => '*',
     sge_accounting_retries => '*',
+    sge_config_cache_ttl => '*',
     sge_debug => '*',
     lsf_bin_path => '*',
     lsf_profile_path => '*',

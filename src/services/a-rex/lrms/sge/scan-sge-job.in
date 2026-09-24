@@ -51,6 +51,9 @@ case $CONFIG_sge_accounting_retries in
   ''|*[!0-9]*) sge_accounting_retries=10 ;;
   *) sge_accounting_retries=$CONFIG_sge_accounting_retries ;;
 esac
+# Jobs submitted longer ago than this are looked up individually rather than
+# widening every bulk accounting query to cover them.
+sge_accounting_window_days=14
 sge_debug "event=scan_start uid=$my_id query_retries=$sge_query_retries accounting_retries=$sge_accounting_retries wakeupperiod=$sge_wakeupperiod"
 
 # Prevent two scanners for the same local account from racing over counters and
@@ -82,8 +85,12 @@ qstat_jobs=`mktemp "${TMPDIR}/sge-jobs.XXXXXX"` || {
   rm -f "$qstat_xml" "$lockdir/pid"; rmdir "$lockdir"; exit 1;
 }
 
+candidates=
+acct_dir=
 cleanup () {
   rm -f "$qstat_xml" "$qstat_xml.err" "$qstat_jobs" "$lockdir/pid"
+  [ -z "$candidates" ] || rm -f "$candidates"
+  [ -z "$acct_dir" ] || rm -rf "$acct_dir"
   rmdir "$lockdir" 2>/dev/null
 }
 trap cleanup 0
@@ -95,6 +102,7 @@ fi
 
 # Run a read-only scheduler query again when the qmaster or accounting service
 # is briefly unavailable.  The number is additional tries after the first one.
+query_not_found_is_answer=
 run_query () {
   query_output=$1
   shift
@@ -112,6 +120,13 @@ run_query () {
     if [ "$query_status" -eq 0 ]; then
       return 0
     fi
+    if [ -n "$query_not_found_is_answer" ] \
+        && grep -i 'not found' "$query_output" "${query_output}.err" >/dev/null 2>&1; then
+      sge_debug "event=query_not_found command=$*"
+      : > "$query_output"
+      : > "${query_output}.err"
+      return 0
+    fi
     if [ "$query_try" -ge "$sge_query_retries" ]; then
       sge_debug "event=query_failed attempts=$((query_try + 1)) exit_status=$query_status command=$*"
       return 1
@@ -122,10 +137,67 @@ run_query () {
   done
 }
 
+# Like run_query, but a lookup that names no job is an answer, not a fault.
+# qacct exits non-zero with "not found" until a record is flushed, and some
+# sites put every scheduler command behind ssh where each attempt is expensive,
+# so retrying that immediately only repeats a known answer. The accounting
+# retry counter already waits for late records across scans.
+run_accounting_query () {
+  query_not_found_is_answer=yes
+  run_query "$@"
+  accounting_query_status=$?
+  query_not_found_is_answer=
+  return "$accounting_query_status"
+}
+
 start_ts=
 [ -n "$perflogdir" ] && start_ts=`date +%s.%N`
 
-if ! run_query "$qstat_xml" /usr/bin/env TZ=UTC "$sge_qstat" -xml -u '*' -s a -q '*'; then
+# Ask Grid Engine only about the accounts that own ARC jobs. On a shared
+# cluster an unrestricted listing is mostly other people's work, all of which
+# must cross to this host and be parsed only to be ignored. An account that
+# cannot be named here widens the query back to every user.
+lrms_uids=
+for ctr_dir in "$@"; do
+  for statusfile in "$ctr_dir"/processing/*.status; do
+    [ -f "$statusfile" ] || continue
+    status=`cat "$statusfile"`
+    [ "$status" = INLRMS ] || [ "$status" = CANCELING ] || continue
+    gridid=${statusfile##*/}
+    gridid=${gridid%.status}
+    localfile=$(control_path "$ctr_dir" "$gridid" "local")
+    [ -f "$localfile" ] || continue
+    if [ "$my_id" != 0 ] && [ ! -O "$localfile" ]; then continue; fi
+    lrms_uids="$lrms_uids $(get_owner_uid "$localfile")"
+  done
+done
+if [ -z "$lrms_uids" ]; then
+  sge_debug "event=scan_idle reason=no_arc_jobs_in_lrms"
+  sleep "$sge_wakeupperiod"
+  exit 0
+fi
+sge_owner_selector=
+for owner_uid in `printf '%s\n' $lrms_uids | sort -u`; do
+  owner_name=`id -nu "$owner_uid" 2>/dev/null`
+  case $owner_name in
+    ''|*[!A-Za-z0-9._-]*|[.-]*) sge_owner_selector='*'; break ;;
+  esac
+  sge_owner_selector="${sge_owner_selector:+$sge_owner_selector,}$owner_name"
+done
+# Grid Engine records the submitting account as the owner, which is the
+# account owning the ARC job unless the site submits some other way. When a
+# job turns out to be alive although it was absent from a restricted snapshot,
+# list every user for a day rather than rely on that assumption.
+all_owners_marker="${TMPDIR}/scan-sge-job.${my_id}.all-owners"
+if [ -f "$all_owners_marker" ] \
+    && /usr/bin/perl -e 'exit !(time - (stat $ARGV[0])[9] < 86400)' "$all_owners_marker"; then
+  sge_owner_selector='*'
+fi
+
+# Jobs submitted once this snapshot has started may legitimately be missing
+# from it, so they must not be taken for jobs that have already finished.
+snapshot_epoch=`date +%s`
+if ! run_query "$qstat_xml" /usr/bin/env TZ=UTC "$sge_qstat" -xml -u "$sge_owner_selector" -s a -q '*'; then
   olog "qstat failed: command=$sge_qstat exit_status=$query_status attempts=$((query_try + 1)); no jobs will be treated as completed"
   [ -s "$qstat_xml.err" ] && cat "$qstat_xml.err" 1>&2
   sleep "$sge_wakeupperiod"
@@ -238,16 +310,24 @@ fi
 write_diagfile_acct () {
   diagfile_acct=$1
   id=$2
+  arc_submit_time=$3
+  prefetched_acct=$4
   qacct_raw="${diagfile_acct}.raw"
 
-  if ! run_query "$qacct_raw" /usr/bin/env TZ=UTC "$sge_qacct" -j "$id"; then
+  if [ -n "$prefetched_acct" ]; then
+    # Records already collected by one bulk query for this scan.
+    if ! cp "$prefetched_acct" "$qacct_raw"; then
+      rm -f "$qacct_raw"
+      : > "$diagfile_acct"
+      return 1
+    fi
+  elif ! run_accounting_query "$qacct_raw" /usr/bin/env TZ=UTC "$sge_qacct" -j "$id"; then
     [ -s "$qacct_raw.err" ] && olog "qacct has no usable record for job $id: `tr '\n' ' ' < "$qacct_raw.err"`"
     rm -f "$qacct_raw" "$qacct_raw.err"
     : > "$diagfile_acct"
     return 1
   fi
 
-  arc_submit_time=$3
   /usr/bin/perl - "$id" "$qacct_raw" "$arc_submit_time" "${CONFIG_sge_debug:-no}" "$gridid" > "$diagfile_acct" <<'PERL'
 use strict;
 use warnings;
@@ -658,6 +738,10 @@ handle_missing_accounting () {
   if [ -z "$skip_live_check" ] \
       && "$sge_qstat" -u '*' -s a -q '*' -j "$id" >/dev/null 2>&1; then
     olog "SGE job $id reappeared while waiting for accounting"
+    if [ "$sge_owner_selector" != '*' ]; then
+      olog "SGE job $id may be owned by an account other than its ARC owner; listing all users for the next day"
+      : > "$all_owners_marker"
+    fi
     rm -f "$countfile"
     return
   fi
@@ -690,6 +774,21 @@ handle_missing_accounting () {
 
 # Process every ARC job once.  This avoids the old nested local-ID search and
 # remains safe for IDs such as 12 and 123 that share a prefix.
+#
+# Accounting is collected in bulk. qacct reads the whole accounting file on
+# every invocation, so one query per disappeared job makes a scan cost a full
+# accounting read for each finished job; where the scheduler is only reachable
+# over ssh that is also one remote login each. The first pass settles every
+# job the snapshot can settle and lists the rest. One query per distinct job
+# name then fetches their records, which are split by job number on this side.
+tab=`printf '\t'`
+candidates=`mktemp "${TMPDIR}/sge-candidates.XXXXXX"` || exit 1
+acct_dir=`mktemp -d "${TMPDIR}/sge-acct.XXXXXX"` || exit 1
+mkdir "$acct_dir/jobs" || exit 1
+: > "$acct_dir/wanted"
+: > "$acct_dir/selectors"
+renamed_names=
+
 for ctr_dir in "$@"; do
   for statusfile in "$ctr_dir"/processing/*.status; do
     [ -f "$statusfile" ] || continue
@@ -751,6 +850,22 @@ for ctr_dir in "$@"; do
       skip_live_check=yes
     fi
     if [ -n "$active_state" ]; then
+      # Remember a rewritten native name while the job is live: qacct records
+      # it under that name, and it is what finds the job in bulk once it ends.
+      # It is kept in GRAMi, which A-REX removes with the job; A-REX does not
+      # know about, and so would never clean up, a control file of our own.
+      if [ -n "$sge_submit_time" ] && [ -n "$sge_job_name" ] \
+          && [ "$active_name" != "$sge_job_name" ]; then
+        case $active_name in
+          ''|-|*[!A-Za-z0-9_]*) ;;
+          *)
+            renamed_names="$renamed_names $active_name"
+            stored_name=`sed -n 's/^joboption_sge_observed_name=//p' "$gramifile" 2>/dev/null | tail -n 1`
+            [ "$stored_name" = "$active_name" ] \
+              || echo "joboption_sge_observed_name=$active_name" >> "$gramifile"
+            ;;
+        esac
+      fi
       rm -f "$countfile"
       case $active_state in
         *E*)
@@ -770,51 +885,159 @@ for ctr_dir in "$@"; do
       continue
     fi
 
-    session=`sed -n 's/^sessiondir=//p' "$localfile" | tail -n 1`
-    if [ -z "$session" ]; then
-      echo "scan-sge-job: missing sessiondir in $localfile" >> "$errorsfile"
-      echo "-1 ARC could not determine the job session directory" > "$donefile"
-      "$GMKICK" -j "$gridid" "$ctr_dir" >> "$errorsfile"
+    if [ -n "$sge_submit_time" ] && [ "$sge_submit_time" -ge "$snapshot_epoch" ]; then
+      sge_debug "event=job_after_snapshot arc_submission_epoch=$sge_submit_time snapshot_epoch=$snapshot_epoch"
       continue
     fi
-    commentfile="${session}.comment"
-    diagfile="${session}.diag"
-
-    # Accept files produced by older SGE job scripts inside the session dir.
-    if [ -n "$session" ] && [ -d "$session" ]; then
-      do_as_uid "$uid" "cat '$session/.comment' >> '$commentfile' 2>/dev/null; rm -f '$session/.comment'"
-      do_as_uid "$uid" "cat '$session/.diag' >> '$diagfile' 2>/dev/null; rm -f '$session/.diag'"
-    fi
-    wrapper_exitcode=`do_as_uid "$uid" "sed -n 's/^exitcode=//p' '$diagfile' 2>/dev/null" | tail -n 1`
-
-    diagfile_tmp=`mktemp "${TMPDIR}/sge-diag.XXXXXX"` || exit 1
-    diagfile_acct=`mktemp "${TMPDIR}/sge-acct.XXXXXX"` || {
-      rm -f "$diagfile_tmp"; exit 1;
-    }
-
-    write_diagfile_acct "$diagfile_acct" "$id" "$sge_submit_time"
-    accounting_status=$?
-
-    failedtext=`sed -n 's/^failed=//p' "$diagfile_acct" | tail -n 1`
-    failedcode=`printf '%s\n' "$failedtext" | awk '{print $1}'`
-    case $failedcode in
-      24|25|30)
-        olog "SGE job $id has a nonterminal migration/rescheduling record; waiting for its final record"
-        : > "$diagfile_acct"
-        accounting_status=1
-        ;;
-    esac
-
-    if [ "$accounting_status" -eq 0 ]; then
-      if add_accounting_to_diag "$diagfile" "$diagfile_acct" "$diagfile_tmp" "$uid" "$commentfile" "$ctr_dir"; then
-        continue
-      fi
-    fi
-
-    rm -f "$diagfile_tmp" "$diagfile_acct" "${diagfile_acct}.raw" "${diagfile_acct}.raw.err"
-    handle_missing_accounting "$countfile" "$uid" "$commentfile" "$errorsfile" "$donefile" "$wrapper_exitcode" "$ctr_dir" "$id" "$eqwfile" "$skip_live_check"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ctr_dir" "$gridid" "$id" "$uid" \
+      "${skip_live_check:--}" "${sge_submit_time:--}" "${sge_job_name:--}" >> "$candidates"
   done
 done
+
+# Choose what to ask qacct for. A name seen on a live job comes first: where a
+# JSV rewrites names one of them usually covers every ARC job. Jobs never seen
+# alive are matched by the prefix ARC gives its own names. Jobs without a
+# recorded submission time predate this and are looked up individually, as are
+# jobs too old for a bounded window.
+now_epoch=`date +%s`
+oldest_submit=
+bulk_generic=
+while IFS="$tab" read -r ctr_dir gridid id uid skip_live_check sge_submit_time sge_job_name <&3; do
+  [ "$sge_submit_time" != - ] || continue
+  [ $((now_epoch - sge_submit_time)) -le $((sge_accounting_window_days * 86400)) ] || continue
+  gramifile=$(control_path "$ctr_dir" "$gridid" "grami")
+  observed_name=`sed -n 's/^joboption_sge_observed_name=//p' "$gramifile" 2>/dev/null | tail -n 1`
+  case $observed_name in
+    ''|*[!A-Za-z0-9_]*)
+      case $sge_job_name in
+        arc_*) bulk_generic=yes ;;
+        *) continue ;;
+      esac
+      ;;
+    *) printf '%s\n' "$observed_name" >> "$acct_dir/selectors" ;;
+  esac
+  printf '%s\n' "$id" >> "$acct_dir/wanted"
+  if [ -z "$oldest_submit" ] || [ "$sge_submit_time" -lt "$oldest_submit" ]; then
+    oldest_submit=$sge_submit_time
+  fi
+done 3< "$candidates"
+if [ -n "$bulk_generic" ]; then
+  printf '%s\n' $renamed_names 'arc_*' >> "$acct_dir/selectors"
+fi
+
+# Split qacct output into one file per job number, keeping record boundaries.
+split_accounting () {
+  awk -v dir="$2" '
+    function flush(  path) {
+      if (job ~ /^[0-9]+$/) {
+        path = dir "/" job
+        printf "==============================================================\n%s", buffer >> path
+        close(path)
+      }
+      buffer = ""
+      job = ""
+    }
+    /^=====/ { flush(); next }
+    { buffer = buffer $0 "\n"; if ($1 == "jobnumber") job = $2 }
+    END { flush() }
+  ' "$1"
+}
+
+all_wanted_found () {
+  while read -r wanted_id; do
+    [ -s "$acct_dir/jobs/$wanted_id" ] || return 1
+  done < "$acct_dir/wanted"
+  return 0
+}
+
+if [ -s "$acct_dir/wanted" ]; then
+  bulk_days=$(( (now_epoch - oldest_submit) / 86400 + 2 ))
+  awk '!seen[$0]++' "$acct_dir/selectors" > "$acct_dir/selectors.unique"
+  while read -r selector <&4; do
+    all_wanted_found && break
+    bulk_raw="$acct_dir/bulk.raw"
+    if run_accounting_query "$bulk_raw" /usr/bin/env TZ=UTC "$sge_qacct" -j "$selector" -d "$bulk_days"; then
+      split_accounting "$bulk_raw" "$acct_dir/jobs"
+    else
+      olog "bulk qacct for job name '$selector' failed; affected jobs wait for the next scan"
+    fi
+    rm -f "$bulk_raw" "$bulk_raw.err"
+  done 4< "$acct_dir/selectors.unique"
+fi
+
+while IFS="$tab" read -r ctr_dir gridid id uid skip_live_check sge_submit_time sge_job_name <&3; do
+  [ "$skip_live_check" != - ] || skip_live_check=
+  [ "$sge_submit_time" != - ] || sge_submit_time=
+  localfile=$(control_path "$ctr_dir" "$gridid" "local")
+  donefile=$(control_path "$ctr_dir" "$gridid" "lrms_done")
+  countfile=$(control_path "$ctr_dir" "$gridid" "lrms_job")
+  errorsfile=$(control_path "$ctr_dir" "$gridid" "errors")
+  eqwfile=$(control_path "$ctr_dir" "$gridid" "lrms_eqw")
+  [ -f "$donefile" ] && continue
+
+  session=`sed -n 's/^sessiondir=//p' "$localfile" | tail -n 1`
+  if [ -z "$session" ]; then
+    echo "scan-sge-job: missing sessiondir in $localfile" >> "$errorsfile"
+    echo "-1 ARC could not determine the job session directory" > "$donefile"
+    "$GMKICK" -j "$gridid" "$ctr_dir" >> "$errorsfile"
+    continue
+  fi
+  commentfile="${session}.comment"
+  diagfile="${session}.diag"
+
+  # Accept files produced by older SGE job scripts inside the session dir.
+  if [ -n "$session" ] && [ -d "$session" ]; then
+    do_as_uid "$uid" "cat '$session/.comment' >> '$commentfile' 2>/dev/null; rm -f '$session/.comment'"
+    do_as_uid "$uid" "cat '$session/.diag' >> '$diagfile' 2>/dev/null; rm -f '$session/.diag'"
+  fi
+  wrapper_exitcode=`do_as_uid "$uid" "sed -n 's/^exitcode=//p' '$diagfile' 2>/dev/null" | tail -n 1`
+
+  diagfile_tmp=`mktemp "${TMPDIR}/sge-diag.XXXXXX"` || exit 1
+  diagfile_acct=`mktemp "${TMPDIR}/sge-acct.XXXXXX"` || {
+    rm -f "$diagfile_tmp"; exit 1;
+  }
+
+  if grep -x -- "$id" "$acct_dir/wanted" >/dev/null 2>&1; then
+    prefetched="$acct_dir/jobs/$id"
+    [ -s "$prefetched" ] || prefetched=/dev/null
+    write_diagfile_acct "$diagfile_acct" "$id" "$sge_submit_time" "$prefetched"
+    accounting_status=$?
+    # A bulk answer can miss a job it should hold, for instance when the name
+    # it was filed under is not one asked for. Before the wait for accounting
+    # runs out, ask for the job by its number.
+    if [ "$accounting_status" -ne 0 ]; then
+      counter=0
+      [ -f "$countfile" ] && read counter < "$countfile"
+      case $counter in ''|*[!0-9]*) counter=0 ;; esac
+      if [ $((counter + 1)) -gt "$sge_accounting_retries" ]; then
+        write_diagfile_acct "$diagfile_acct" "$id" "$sge_submit_time"
+        accounting_status=$?
+      fi
+    fi
+  else
+    write_diagfile_acct "$diagfile_acct" "$id" "$sge_submit_time"
+    accounting_status=$?
+  fi
+
+  failedtext=`sed -n 's/^failed=//p' "$diagfile_acct" | tail -n 1`
+  failedcode=`printf '%s\n' "$failedtext" | awk '{print $1}'`
+  case $failedcode in
+    24|25|30)
+      olog "SGE job $id has a nonterminal migration/rescheduling record; waiting for its final record"
+      : > "$diagfile_acct"
+      accounting_status=1
+      ;;
+  esac
+
+  if [ "$accounting_status" -eq 0 ]; then
+    if add_accounting_to_diag "$diagfile" "$diagfile_acct" "$diagfile_tmp" "$uid" "$commentfile" "$ctr_dir"; then
+      continue
+    fi
+  fi
+
+  rm -f "$diagfile_tmp" "$diagfile_acct" "${diagfile_acct}.raw" "${diagfile_acct}.raw.err"
+  handle_missing_accounting "$countfile" "$uid" "$commentfile" "$errorsfile" "$donefile" "$wrapper_exitcode" "$ctr_dir" "$id" "$eqwfile" "$skip_live_check"
+done 3< "$candidates"
 
 sge_debug "event=scan_end sleep_seconds=$sge_wakeupperiod"
 sleep "$sge_wakeupperiod"

@@ -191,6 +191,15 @@
         </xsd:annotation>
     </xsd:element>
 
+    <xsd:element name="sge_config_cache_ttl" type="xsd:nonNegativeInteger">
+        <xsd:annotation>
+            <xsd:documentation xml:lang="en">
+                Seconds a submission may reuse previously fetched parallel
+                environment and complex configuration; 0 disables reuse.
+            </xsd:documentation>
+        </xsd:annotation>
+    </xsd:element>
+
     <xsd:element name="lsf_bin_path" type="xsd:string">
         <xsd:annotation>
             <xsd:documentation xml:lang="en">

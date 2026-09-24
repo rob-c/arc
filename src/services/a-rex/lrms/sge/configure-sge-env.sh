@@ -153,6 +153,18 @@ for my $file (@files) {
     my $number = 0;
     while (my $line = <$fh>) {
         ++$number;
+        next if $line =~ /^\s*#/;
+        # ARC's script directives use Grid Engine's default '#$' prefix and no
+        # longer name it on the qsub command line, where some qsub front ends
+        # pass arguments through a shell that reads '#' as a comment. Another
+        # default prefix would silently discard every ARC directive. The value
+        # itself begins with '#', so check it before comments are removed.
+        while ($line =~ s/(^|\s)-C(?:\s+(\S+))?/$1/) {
+            my $prefix = defined $2 ? $2 : '';
+            $prefix =~ tr/'"//d;
+            die "Unsafe qsub default '-C $prefix' in $file line $number\n"
+                unless $prefix eq '#$';
+        }
         $line =~ s/#.*//;
         next if $line =~ /^\s*$/;
         my @words = eval { shellwords($line) };
@@ -194,6 +206,52 @@ for my $file (@files) {
     close($fh) or die "Cannot close qsub defaults $file: $!\n";
 }
 PERL
+}
+
+# Parallel environment and complex definitions change rarely, yet every
+# submission needs them, and where the scheduler is only reachable over ssh
+# each query is another remote login. Reuse a successful answer for a few
+# minutes. The cache is private to the submitting account; if anything about
+# it is unexpected the query simply runs.
+sge_config_cache_ttl=${CONFIG_sge_config_cache_ttl:-300}
+case $sge_config_cache_ttl in
+    ''|*[!0-9]*) sge_config_cache_ttl=300 ;;
+esac
+
+# Usage: sge_config_query <cache key> <command> [arguments]
+sge_config_query () {
+    sge_cq_key=$1
+    shift
+    case $sge_cq_key in
+        ''|.*|*[!A-Za-z0-9_.-]*) "$@"; return ;;
+    esac
+    [ "$sge_config_cache_ttl" -gt 0 ] || { "$@"; return; }
+    # One cache per account and per Grid Engine installation.
+    sge_cq_cluster=`printf '%s\n' "$SGE_ROOT" "$SGE_CELL" "${SGE_QMASTER_PORT:-}" | cksum | cut -d' ' -f1`
+    sge_cq_dir="${TMPDIR:-/tmp}/arc-sge-config.`id -u`.$sge_cq_cluster"
+    sge_cq_file="$sge_cq_dir/$sge_cq_key"
+    [ -d "$sge_cq_dir" ] || (umask 077 && mkdir "$sge_cq_dir") 2>/dev/null
+    if [ ! -d "$sge_cq_dir" ] || [ -L "$sge_cq_dir" ] || [ ! -O "$sge_cq_dir" ]; then
+        "$@"
+        return
+    fi
+    if [ -f "$sge_cq_file" ] && [ ! -L "$sge_cq_file" ] && [ -O "$sge_cq_file" ] \
+        && /usr/bin/perl -e 'exit !(time - (stat $ARGV[0])[9] < $ARGV[1])' \
+            "$sge_cq_file" "$sge_config_cache_ttl"; then
+        sge_debug "event=config_cache_hit key=$sge_cq_key"
+        cat "$sge_cq_file"
+        return
+    fi
+    sge_cq_tmp=`mktemp "$sge_cq_dir/.$sge_cq_key.XXXXXX" 2>/dev/null` || { "$@"; return; }
+    if "$@" > "$sge_cq_tmp"; then
+        mv -f "$sge_cq_tmp" "$sge_cq_file" 2>/dev/null || rm -f "$sge_cq_tmp"
+        if [ -f "$sge_cq_file" ]; then cat "$sge_cq_file"; else "$@"; fi
+        return
+    fi
+    sge_cq_status=$?
+    cat "$sge_cq_tmp"
+    rm -f "$sge_cq_tmp"
+    return "$sge_cq_status"
 }
 
 # ARC submits ordinary (non-array) jobs, whose Grid Engine identifier is an

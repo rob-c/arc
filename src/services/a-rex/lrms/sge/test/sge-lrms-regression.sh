@@ -119,7 +119,8 @@ reset_scheduler () {
     printf '0\n' > "$TEST_ROOT/qacct.rc"
     printf '0\n' > "$TEST_ROOT/qdel.rc"
     rm -f "$TEST_ROOT/submitted.job" "$TEST_ROOT/stdout" "$TEST_ROOT/stderr" \
-        "$TEST_ROOT/qsub.break_grami" "$TEST_ROOT/qsub.cwd"
+        "$TEST_ROOT/qsub.break_grami" "$TEST_ROOT/qsub.cwd" \
+        "$TEST_ROOT/tmp/scan-sge-job."*".all-owners"
 }
 
 write_submit_grami () {
@@ -165,10 +166,11 @@ assert_success 'terse qsub success is accepted' run_submit "$TEST_ROOT/success.g
 assert_not_grep 'debug tracing is disabled by default' 'DEBUG event=' "$TEST_ROOT/stderr"
 assert_grep 'submission log correlates ARC and scheduler IDs' \
     'arc_job=arcjob .*event=submitted assigned_sge_job=73001' "$TEST_ROOT/stderr"
-assert_grep 'qsub uses terse output and takes the script on stdin' \
-    '^qsub -terse -b n -shell y -wd .+ -v __SGE_PREFIX__O_WORKDIR=.+ -S [^ ]+$' "$TEST_ROOT/calls"
-assert_not_grep 'qsub passes no argument a remote shell would re-parse' \
-    '[#$*?\\]' "$TEST_ROOT/calls"
+# The script travels on stdin and no argument needs shell quoting, so the
+# command survives a qsub that forwards its arguments through a remote shell.
+assert_grep 'qsub uses terse output and reads the script from stdin' \
+    '^qsub -terse -b n -shell y -wd /tmp -v __SGE_PREFIX__O_WORKDIR=[^ ]+ -S /bin/sh$' "$TEST_ROOT/calls"
+assert_not_grep 'no qsub argument starts a remote-shell comment' '^qsub .* #' "$TEST_ROOT/calls"
 assert_grep 'qsub ignores submission-directory request defaults' \
     '/sge-qsub\.[A-Za-z0-9]+$' "$TEST_ROOT/qsub.cwd"
 assert_grep 'the terse job ID is persisted in GRAMi' '^joboption_jobid=73001$' "$TEST_ROOT/success.grami"
@@ -535,6 +537,9 @@ assert_failure 'detached SGE workers are rejected before submission' \
     run_submit_config "$TEST_ROOT/detached.conf" "$TEST_ROOT/detached.grami"
 assert_not_grep 'detached job never reaches qsub' '^qsub ' "$TEST_ROOT/calls"
 
+# The fake common layer reports the test runner as the owner of every job.
+test_owner=`id -nu`
+
 make_scan_job () {
     control_dir=$1
     grid_id=$2
@@ -614,8 +619,8 @@ ru_wallclock 4.0
 cpu          3.0
 EOF
 assert_success 'qstat XML and terminal qacct record complete a disappeared job' run_scan "$scan_control"
-assert_grep 'scanner explicitly requests all Grid Engine job states' \
-    '^qstat -xml -u \* -s a -q \*$' "$TEST_ROOT/calls"
+assert_grep 'scanner requests all job states for the owning accounts only' \
+    "^qstat -xml -u $test_owner -s a -q \\*\$" "$TEST_ROOT/calls"
 assert_grep 'the exact disappeared ID is queried in qacct' '^qacct -j 12$' "$TEST_ROOT/calls"
 assert_not_grep 'the exact active ID is not queried in qacct' '^qacct -j 123$' "$TEST_ROOT/calls"
 assert_grep 'terminal accounting writes successful completion' '^0$' "$scan_control/jobs/arc12.lrms_done"
@@ -777,7 +782,7 @@ EOF
 assert_success 'overridden qstat selector defaults are accepted' \
     run_scan "$defaults_control"
 assert_grep 'scanner overrides safe qstat selector defaults' \
-    '^qstat -xml -u \* -s a -q \*$' "$TEST_ROOT/calls"
+    "^qstat -xml -u $test_owner -s a -q \\*\$" "$TEST_ROOT/calls"
 
 reset_scheduler
 printf '%s\n' '-ne' > "$TEST_ROOT/sge/default/common/sge_qstat"
@@ -1061,6 +1066,250 @@ EOF
 assert_success 'parallel ambiguous-limit accounting is handled' run_scan "$parallel_limit_control"
 assert_not_grep 'per-slot memory is not falsely classified as exceeded' \
     '^271 job killed: memory$' "$parallel_limit_control/jobs/parallelmemory.lrms_done"
+
+# Scheduler round trips. Where Grid Engine is reached through a remote shell
+# every command is a login and every qacct a full read of the accounting file,
+# so the scanner asks once per scan and does the matching on this side.
+accounting_record () {
+    record_time=`/usr/bin/perl -MPOSIX=strftime -e 'print strftime("%m/%d/%Y %H:%M:%S", gmtime($ARGV[0]))' "$2"`
+    cat <<EOF
+==============================================================
+qname        short.q
+hostname     node05.example
+jobnumber    $1
+taskid       undefined
+pe_taskid    NONE
+slots        1
+qsub_time    $record_time
+start_time   $record_time
+end_time     $record_time
+failed       0
+exit_status  $3
+ru_wallclock 1.0
+cpu          1.0
+EOF
+}
+
+run_scan_config () {
+    config_path=$1
+    control_dir=$2
+    "$TEST_ROOT/scan-sge-job" --config "$config_path" "$control_dir" \
+        > "$TEST_ROOT/stdout" 2> "$TEST_ROOT/stderr"
+}
+
+assert_count () {
+    description=$1
+    expected=$2
+    pattern=$3
+    path=$4
+    actual=`grep -c -E -- "$pattern" "$path" 2>/dev/null`
+    if [ "${actual:-0}" -eq "$expected" ]; then
+        ok "$description"
+    else
+        not_ok "$description (expected $expected, saw ${actual:-0})"
+    fi
+}
+
+recent_submit=$((`date +%s` - 3600))
+empty_snapshot='<job_info><queue_info/><job_info/></job_info>'
+
+# The snapshot of a recycled ID belongs to another job; its name is not ARC's.
+if ! grep '^joboption_sge_observed_name=' "$reused_control/jobs/reusedid.grami" >/dev/null; then
+    ok 'a recycled live ID does not lend its name to the ARC job'
+else
+    not_ok 'a recycled live ID does not lend its name to the ARC job'
+fi
+
+# Nothing in the LRMS means nothing to ask the scheduler.
+reset_scheduler
+idle_control=$TEST_ROOT/idle-control
+make_scan_job "$idle_control" idlejob 60
+printf 'FINISHING\n' > "$idle_control/processing/idlejob.status"
+assert_success 'a scan with no ARC jobs in the LRMS succeeds' run_scan "$idle_control"
+assert_not_grep 'no scheduler command runs without ARC jobs in the LRMS' '^q' "$TEST_ROOT/calls"
+
+# Several disappeared jobs are answered by one query for their native name.
+reset_scheduler
+bulk_control=$TEST_ROOT/bulk-control
+make_scan_job "$bulk_control" bulkseen 101
+make_scan_job "$bulk_control" bulkunseen 102
+printf 'joboption_sge_submit_time=%s\njoboption_sge_job_name=arc_job_bulkseen\n' \
+    "$recent_submit" > "$bulk_control/jobs/bulkseen.grami"
+printf 'joboption_sge_submit_time=%s\njoboption_sge_job_name=arc_job_bulkunseen\n' \
+    "$recent_submit" > "$bulk_control/jobs/bulkunseen.grami"
+printf 'joboption_sge_observed_name=sitename\n' >> "$bulk_control/jobs/bulkseen.grami"
+printf '%s\n' "$empty_snapshot" > "$TEST_ROOT/qstat.xml"
+{ accounting_record 101 "$recent_submit" 0
+  accounting_record 102 "$recent_submit" 3; } > "$TEST_ROOT/qacct.output"
+assert_success 'bulk accounting completes several disappeared jobs' run_scan "$bulk_control"
+assert_grep 'accounting is fetched by the observed native name' \
+    '^qacct -j sitename -d 2$' "$TEST_ROOT/calls"
+assert_count 'one accounting query serves every disappeared job' 1 '^qacct ' "$TEST_ROOT/calls"
+assert_grep 'the bulk answer completes the first job' '^0$' "$bulk_control/jobs/bulkseen.lrms_done"
+assert_grep 'the bulk answer completes the second job with its own status' \
+    '^3 Job failed with exit code 3$' "$bulk_control/jobs/bulkunseen.lrms_done"
+
+# A job never seen under another name is found by ARC's own name prefix.
+reset_scheduler
+generic_control=$TEST_ROOT/generic-control
+make_scan_job "$generic_control" genericjob 103
+printf 'joboption_sge_submit_time=%s\njoboption_sge_job_name=arc_job_genericjob\n' \
+    "$recent_submit" > "$generic_control/jobs/genericjob.grami"
+printf '%s\n' "$empty_snapshot" > "$TEST_ROOT/qstat.xml"
+accounting_record 103 "$recent_submit" 0 > "$TEST_ROOT/qacct.output"
+assert_success 'accounting by the ARC name prefix completes a job' run_scan "$generic_control"
+assert_grep 'the ARC name prefix selects accounting' '^qacct -j arc_\* -d 2$' "$TEST_ROOT/calls"
+assert_not_grep 'no per-job accounting query is needed' '^qacct -j [0-9]+$' "$TEST_ROOT/calls"
+assert_grep 'the prefix answer completes the job' '^0$' "$generic_control/jobs/genericjob.lrms_done"
+
+# A name rewritten by the site is remembered while the job is live.
+reset_scheduler
+observe_control=$TEST_ROOT/observe-control
+make_scan_job "$observe_control" observed 104
+printf 'joboption_sge_submit_time=%s\njoboption_sge_job_name=arc_job_observed\n' \
+    "$recent_submit" > "$observe_control/jobs/observed.grami"
+observed_time=`/usr/bin/perl -MPOSIX=strftime -e 'print strftime("%Y-%m-%dT%H:%M:%S", gmtime($ARGV[0]))' "$recent_submit"`
+cat > "$TEST_ROOT/qstat.xml" <<EOF
+<?xml version='1.0'?>
+<job_info><queue_info/><job_info>
+<job_list state="pending"><JB_job_number>104</JB_job_number><JB_name>sitename</JB_name><JB_submission_time>$observed_time</JB_submission_time><state>qw</state></job_list>
+</job_info></job_info>
+EOF
+assert_success 'a live job under a rewritten name is scanned' run_scan "$observe_control"
+assert_grep 'the rewritten native name is remembered in GRAMi' '^joboption_sge_observed_name=sitename$' \
+    "$observe_control/jobs/observed.grami"
+assert_success 'the live renamed job is scanned again' run_scan "$observe_control"
+assert_count 'an unchanged observed name is recorded once' 1 \
+    '^joboption_sge_observed_name=' "$observe_control/jobs/observed.grami"
+if ls "$observe_control/jobs/" | grep -v -E '\.(status|local|grami|errors|lrms_job|lrms_done|lrms_eqw)$' >/dev/null; then
+    not_ok 'no control file unknown to A-REX is created'
+else
+    ok 'no control file unknown to A-REX is created'
+fi
+assert_not_grep 'a live job is not looked up in accounting' '^qacct ' "$TEST_ROOT/calls"
+reset_scheduler
+printf '%s\n' "$empty_snapshot" > "$TEST_ROOT/qstat.xml"
+accounting_record 104 "$recent_submit" 0 > "$TEST_ROOT/qacct.output"
+assert_success 'the renamed job is completed once it has ended' run_scan "$observe_control"
+assert_grep 'accounting is fetched by the remembered name' '^qacct -j sitename -d 2$' "$TEST_ROOT/calls"
+assert_grep 'the remembered name completes the job' '^0$' "$observe_control/jobs/observed.lrms_done"
+
+# A job submitted after the snapshot began may be missing from it.
+reset_scheduler
+late_control=$TEST_ROOT/late-control
+make_scan_job "$late_control" latejob 105
+printf 'joboption_sge_submit_time=%s\njoboption_sge_job_name=arc_job_latejob\n' \
+    $((`date +%s` + 600)) > "$late_control/jobs/latejob.grami"
+printf '%s\n' "$empty_snapshot" > "$TEST_ROOT/qstat.xml"
+assert_success 'a job newer than the snapshot is scanned' run_scan "$late_control"
+assert_not_grep 'a job newer than the snapshot is not looked up' '^qacct ' "$TEST_ROOT/calls"
+if [ ! -e "$late_control/jobs/latejob.lrms_job" ] && [ ! -e "$late_control/jobs/latejob.lrms_done" ]; then
+    ok 'a job newer than the snapshot is left alone'
+else
+    not_ok 'a job newer than the snapshot is left alone'
+fi
+
+# "Not found" is an answer: repeating it at once cannot change it.
+reset_scheduler
+printf 'CONFIG_sge_query_retries=2\n' > "$TEST_ROOT/retries.conf"
+notfound_control=$TEST_ROOT/notfound-control
+make_scan_job "$notfound_control" notyet 106
+printf '%s\n' "$empty_snapshot" > "$TEST_ROOT/qstat.xml"
+printf 'error: job id 106 not found\n' > "$TEST_ROOT/qacct.output"
+printf '1\n' > "$TEST_ROOT/qacct.rc"
+assert_success 'a job without accounting yet is scanned' \
+    run_scan_config "$TEST_ROOT/retries.conf" "$notfound_control"
+assert_count 'a not-found accounting answer is not retried within the scan' 1 '^qacct ' "$TEST_ROOT/calls"
+assert_grep 'a not-found answer starts the bounded wait' '^1$' "$notfound_control/jobs/notyet.lrms_job"
+reset_scheduler
+transient_control=$TEST_ROOT/transient-control
+make_scan_job "$transient_control" transient 107
+printf '%s\n' "$empty_snapshot" > "$TEST_ROOT/qstat.xml"
+printf 'error: unable to contact qmaster\n' > "$TEST_ROOT/qacct.output"
+printf '1\n' > "$TEST_ROOT/qacct.rc"
+assert_success 'a failing accounting service is scanned' \
+    run_scan_config "$TEST_ROOT/retries.conf" "$transient_control"
+assert_count 'a failing accounting query is still retried' 3 '^qacct ' "$TEST_ROOT/calls"
+
+# Before the wait for accounting runs out, the job is asked for by number.
+reset_scheduler
+fallback_control=$TEST_ROOT/fallback-control
+make_scan_job "$fallback_control" fallbackjob 108
+printf 'joboption_sge_submit_time=%s\njoboption_sge_job_name=arc_job_fallbackjob\n' \
+    "$recent_submit" > "$fallback_control/jobs/fallbackjob.grami"
+printf 'joboption_sge_observed_name=elsewhere\n' >> "$fallback_control/jobs/fallbackjob.grami"
+printf '1\n' > "$fallback_control/jobs/fallbackjob.lrms_job"
+printf '%s\n' "$empty_snapshot" > "$TEST_ROOT/qstat.xml"
+accounting_record 999 "$recent_submit" 0 > "$TEST_ROOT/qacct.output"
+assert_success 'a job missing from the bulk answer is scanned' run_scan "$fallback_control"
+assert_grep 'the bulk query is made first' '^qacct -j elsewhere -d 2$' "$TEST_ROOT/calls"
+assert_grep 'the final retry asks for the job by number' '^qacct -j 108$' "$TEST_ROOT/calls"
+assert_grep 'the exhausted wait completes from the wrapper status' '^0$' \
+    "$fallback_control/jobs/fallbackjob.lrms_done"
+
+# Scheduler configuration is fetched once within the cache lifetime.
+reset_scheduler
+rm -rf "$TEST_ROOT/tmp/arc-sge-config."*
+printf "CONFIG_sge_memory_resource='mem_per_slot'\nCONFIG_sge_config_cache_ttl=300\n" > "$TEST_ROOT/cache.conf"
+printf 'mem_per_slot mps MEMORY <= YES YES 0 0\n' > "$TEST_ROOT/qconf.sc"
+for cache_run in 1 2; do
+    write_submit_grami "$TEST_ROOT/cache-$cache_run.grami" 1
+    printf "joboption_memory='768'\n" >> "$TEST_ROOT/cache-$cache_run.grami"
+    printf '7310%s\n' "$cache_run" > "$TEST_ROOT/qsub.output"
+    assert_success "submission $cache_run succeeds with the configuration cache" \
+        run_submit_config "$TEST_ROOT/cache.conf" "$TEST_ROOT/cache-$cache_run.grami"
+done
+assert_count 'the complex configuration is queried once for both submissions' 1 '^qconf -sc$' "$TEST_ROOT/calls"
+assert_grep 'the cached complex configuration still shapes the request' \
+    '^#\$ -l mem_per_slot=768M$' "$TEST_ROOT/submitted.job"
+reset_scheduler
+rm -rf "$TEST_ROOT/tmp/arc-sge-config."*
+printf '1\n' > "$TEST_ROOT/qconf.rc"
+write_submit_grami "$TEST_ROOT/cache-fail.grami" 1
+printf "joboption_memory='768'\n" >> "$TEST_ROOT/cache-fail.grami"
+assert_failure 'a failed configuration query fails the submission' \
+    run_submit_config "$TEST_ROOT/cache.conf" "$TEST_ROOT/cache-fail.grami"
+printf '0\n' > "$TEST_ROOT/qconf.rc"
+printf 'mem_per_slot mps MEMORY <= YES YES 0 0\n' > "$TEST_ROOT/qconf.sc"
+printf '73103\n' > "$TEST_ROOT/qsub.output"
+assert_success 'a failed configuration answer is not reused' \
+    run_submit_config "$TEST_ROOT/cache.conf" "$TEST_ROOT/cache-fail.grami"
+assert_count 'the configuration is queried again after a failure' 2 '^qconf -sc$' "$TEST_ROOT/calls"
+rm -rf "$TEST_ROOT/tmp/arc-sge-config."*
+
+# Grid Engine records the submitting account as owner. A job alive outside
+# the owner-restricted listing makes the scanner list every user for a day.
+reset_scheduler
+owner_control=$TEST_ROOT/owner-control
+make_scan_job "$owner_control" otherowner 109
+printf '%s\n' "$empty_snapshot" > "$TEST_ROOT/qstat.xml"
+printf '0\n' > "$TEST_ROOT/qstat.job.rc"
+assert_success 'a job alive outside the owner listing is scanned' run_scan "$owner_control"
+assert_grep 'the live check finds the job' '^qstat -u \* -s a -q \* -j 109$' "$TEST_ROOT/calls"
+assert_grep 'the widened listing is explained' 'listing all users for the next day' "$TEST_ROOT/stderr"
+if [ ! -e "$owner_control/jobs/otherowner.lrms_done" ]; then
+    ok 'a job alive outside the owner listing is not completed'
+else
+    not_ok 'a job alive outside the owner listing is not completed'
+fi
+: > "$TEST_ROOT/calls"
+assert_success 'the next scan lists every user' run_scan "$owner_control"
+assert_grep 'the next snapshot is not restricted to owners' '^qstat -xml -u \* -s a -q \*$' "$TEST_ROOT/calls"
+reset_scheduler
+
+# ARC's directives rely on Grid Engine's default prefix.
+reset_scheduler
+printf '%s\n' "-C '#PBS'" > "$TEST_ROOT/sge/default/common/sge_request"
+write_submit_grami "$TEST_ROOT/default-prefix.grami" 1
+assert_failure 'a default directive prefix other than #$ is rejected' \
+    run_submit "$TEST_ROOT/default-prefix.grami"
+assert_not_grep 'a foreign directive prefix never reaches qsub' '^qsub ' "$TEST_ROOT/calls"
+reset_scheduler
+printf '%s\n' "-C '#\$' -w e" > "$TEST_ROOT/sge/default/common/sge_request"
+printf '73104\n' > "$TEST_ROOT/qsub.output"
+assert_success 'the standard directive prefix as a default is accepted' \
+    run_submit "$TEST_ROOT/default-prefix.grami"
+rm -f "$TEST_ROOT/sge/default/common/sge_request"
 
 run_cancel () {
     grami_path=$1

@@ -43,6 +43,49 @@ Grid Engine buffers accounting writes.  Tune `sge_accounting_retries` and
 The scanner treats migration/rescheduling records (failed codes 24, 25 and 30)
 as nonterminal and waits for a later master/summary record.
 
+Scheduler round trips
+---------------------
+
+Every `qacct` invocation reads the whole accounting file, so its cost is set by
+the size of that file rather than by the question asked; on a large cluster it
+can take the better part of a minute. Some sites also reach Grid Engine only
+through a front end which runs each command on another host. The backend is
+therefore built to ask few, broad questions and do the matching locally:
+
+* The scanner lists only the accounts owning ARC jobs in the LRMS (`qstat -xml
+  -u owner,...`) and makes no scheduler call at all when there are none. If a
+  job is found alive although it was absent from that listing, which happens
+  when a site submits under an account other than the ARC job's owner, the
+  scanner lists every user for the following day and says so in the helper log.
+* Jobs that have left `qstat` are looked up in accounting together: one
+  `qacct -j NAME -d DAYS` per distinct job name, with the records split by job
+  number on the ARC side. The name is the one Grid Engine reported while the
+  job was live (a JSV may have rewritten ARC's), remembered in the job's GRAMi
+  as `joboption_sge_observed_name`; jobs never seen under another name are
+  found by the `arc_*` prefix ARC gives its own names. `DAYS` covers the oldest
+  such job's submission. Jobs submitted more than 14 days ago, and jobs from
+  before submission times were recorded, are looked up individually. Before a
+  job's accounting wait is exhausted it is always looked up individually once.
+* A job submitted after the scanner's `qstat` snapshot started is not treated
+  as finished merely because the snapshot does not list it.
+* `qacct` reporting that a job is not found is an answer, not a failure: it is
+  not retried within the pass (`sge_query_retries` applies to failures), and
+  the job waits for its record through `sge_accounting_retries` as before.
+* Submission reuses the parallel-environment and complex configuration (`qconf
+  -spl`, `-sp`, `-sc`) fetched by an earlier submission for
+  `sge_config_cache_ttl` seconds (default 300, 0 disables). Only successful
+  answers are kept, in a directory private to the submitting account and
+  specific to the Grid Engine root, cell and qmaster port.
+* `qsub` receives the job script on stdin and no argument that needs shell
+  quoting. ARC's directives use Grid Engine's default `#$` prefix; a site
+  `sge_request` default setting any other `-C` prefix is rejected.
+
+Front ends which run the Grid Engine commands elsewhere must pass stdin through
+and preserve the environment ARC sets for each command: `LC_ALL=C` and, for
+`qstat -xml` and `qacct`, `TZ=UTC`. Timestamps are interpreted as UTC, so a front
+end that drops `TZ` makes every submission time appear shifted by the remote
+host's UTC offset, and live jobs are then taken for reused job IDs.
+
 ARC submits from a private empty directory, starts its ordered request options
 with `-clear`, and explicitly restores script interpretation. Global and
 passwd-home request defaults which Grid Engine consumes before `-clear` are
@@ -86,6 +129,8 @@ Start with one ARC job ID and follow these events:
 * `job_snapshot`: compares ARC and scheduler states and submission epochs.
   A live record with a different submission epoch may belong to a reused ID;
   a JSV name rewrite alone does not complete the original job.
+  `job_after_snapshot` marks a job submitted after the snapshot started, and
+  `query_not_found` a lookup that `qacct` answered with no record.
 * `accounting`: explains `no_matching_job`, `no_master_record`,
   `submission_time_mismatch`, `incomplete_terminal_record` or `selected_master`.
   `accounting_wait` reports the pass counter; `accounting_exhausted` records
@@ -97,9 +142,10 @@ Start with one ARC job ID and follow these events:
 Useful read-only checks with the same SGE environment (substitute the numeric
 native job ID and configured PE/complex names):
 
-    LC_ALL=C TZ=UTC "$SGE_BIN_PATH/qstat" -xml -u '*' -s a -q '*'
+    LC_ALL=C TZ=UTC "$SGE_BIN_PATH/qstat" -xml -u OWNER -s a -q '*'
     LC_ALL=C "$SGE_BIN_PATH/qstat" -u '*' -s a -q '*' -j JOB_ID
     LC_ALL=C TZ=UTC "$SGE_BIN_PATH/qacct" -j JOB_ID
+    LC_ALL=C TZ=UTC "$SGE_BIN_PATH/qacct" -j 'arc_*' -d 2
     LC_ALL=C "$SGE_BIN_PATH/qconf" -sp PE_NAME
     LC_ALL=C "$SGE_BIN_PATH/qconf" -sc
 

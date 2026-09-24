@@ -711,6 +711,14 @@
 ## default: 10
 #sge_accounting_retries=10
 
+## sge_config_cache_ttl = numsec - How long a submission may reuse Grid Engine's
+## parallel environment and complex configuration (qconf -spl, -sp, -sc) fetched by
+## an earlier submission, instead of querying it again for every job. Only successful
+## answers are reused, per local account and Grid Engine installation. Set 0 to query
+## for every submission.
+## default: 300
+#sge_config_cache_ttl=300
+
 ## sge_debug = yes/no - Trace SGE commands, timings, job identity and accounting
 ## decisions to the existing helperlog (scanner) and job errors (submit/cancel).
 ## Debug messages include arc_job and sge_job for correlation. Job scripts and

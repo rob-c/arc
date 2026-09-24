@@ -11,7 +11,7 @@
 echo "----- starting submit_sge_job -----" 1>&2
 
 joboption_lrms="sge"
-lrms_options="sge_root sge_cell sge_qmaster_port sge_execd_port sge_bin_path sge_jobopts sge_pe sge_exclusive_resource sge_memory_resource sge_debug"
+lrms_options="sge_root sge_cell sge_qmaster_port sge_execd_port sge_bin_path sge_jobopts sge_pe sge_exclusive_resource sge_memory_resource sge_config_cache_ttl sge_debug"
 queue_options="sge_queues sge_jobopts sge_pe sge_exclusive_resource sge_memory_resource"
 
 # ARC1 passes first the config file.
@@ -179,7 +179,7 @@ submission_error () {
 # where a nodeproperty equal to an installed PE selects it.
 if [ "$joboption_count" -gt 1 ]; then
   sge_debug "event=query command=$sge_qconf options=-spl"
-  if ! sge_parallel_environment_list=$("$sge_qconf" -spl 2>"$LRMS_JOB_ERR"); then
+  if ! sge_parallel_environment_list=$(sge_config_query qconf-spl "$sge_qconf" -spl 2>"$LRMS_JOB_ERR"); then
     cat "$LRMS_JOB_ERR" 1>&2
     submission_error "Unable to query the configured SGE parallel environments"
   fi
@@ -207,7 +207,7 @@ if [ "$joboption_count" -gt 1 ]; then
   fi
 
   sge_debug "event=query command=$sge_qconf options=-sp pe=$selected_pe"
-  pe_configuration=$("$sge_qconf" -sp "$selected_pe" 2>"$LRMS_JOB_ERR") || {
+  pe_configuration=$(sge_config_query "qconf-sp-$selected_pe" "$sge_qconf" -sp "$selected_pe" 2>"$LRMS_JOB_ERR") || {
     cat "$LRMS_JOB_ERR" 1>&2
     submission_error "Unable to inspect SGE parallel environment '$selected_pe'"
   }
@@ -254,7 +254,7 @@ fi
 # resources explicitly marked requestable by the Grid Engine administrator.
 sge_complexes=
 if [ "$joboption_exclusivenode" = "true" ] || [ -n "$joboption_cputime" ] || [ -n "$joboption_walltime" ] || [ -n "$joboption_memory" ] || [ -n "$CONFIG_defaultmemory" ]; then
-  if ! sge_complexes=$("$sge_qconf" -sc 2>"$LRMS_JOB_ERR"); then
+  if ! sge_complexes=$(sge_config_query qconf-sc "$sge_qconf" -sc 2>"$LRMS_JOB_ERR"); then
     cat "$LRMS_JOB_ERR" 1>&2
     submission_error "Unable to query the SGE complex configuration"
   fi

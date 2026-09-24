@@ -166,6 +166,19 @@ for my $file (@files) {
             die "Unsafe qsub option-file default '$option' in $file line $number\n"
                 if $option =~ /^-@/
                     || $option =~ /^-(?:t|tc|binding)(?:=|$)/;
+            # ARC no longer passes -C on the qsub command line, because '#$'
+            # cannot be carried intact through a qsub that forwards its
+            # arguments to a remote shell. It relies on Grid Engine's default
+            # prefix instead, so a default that redefines the prefix would make
+            # every directive in the job script invisible - no queue, no name,
+            # no output path - and the job would run with none of them. Refuse
+            # it here, where it is a clear submission error, rather than let it
+            # become a job that silently ignores what ARC asked for.
+            if ($option eq '-C' || $option =~ /^-C=/) {
+                my $value = $option =~ /^-C=(.*)$/ ? $1 : $words[$i + 1];
+                die "Unsafe qsub default '-C' in $file line $number: ARC needs Grid Engine's default directive prefix\n"
+                    unless defined $value && $value eq '#$';
+            }
             if ($option eq '-sync') {
                 my $value = $words[$i + 1];
                 die "Missing value for qsub default '$option' in $file line $number\n"

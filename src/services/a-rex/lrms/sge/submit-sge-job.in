@@ -685,9 +685,18 @@ qsub_workdir=`mktemp -d "${TMPDIR}/sge-qsub.XXXXXX"` || {
   # does its own cd into the session directory a few lines in, where a failure
   # is an ordinary job failure A-REX can see and rerun, and SGE_O_WORKDIR is
   # exported explicitly, so nothing depends on the shepherd's chdir.
-  "$sge_qsub" -terse -b n -shell y -C '#$' -wd /tmp \
+  # The script goes in on stdin, as upstream has always sent it, and every
+  # remaining argument is free of shell metacharacters. Some sites reach Grid
+  # Engine through a qsub that forwards its arguments over ssh, where a remote
+  # shell parses them a second time. Two things do not survive that: '#$' as an
+  # argument opens a comment there, so -C loses its value and everything after
+  # it is discarded, and a script named by local path does not exist on the
+  # far side. '#$' is Grid Engine's own default directive prefix, so -C is not
+  # needed to get it - validate_sge_qsub_defaults refuses a -C that would
+  # change it, rather than leaving that assumption unchecked.
+  "$sge_qsub" -terse -b n -shell y -wd /tmp \
     -v "__SGE_PREFIX__O_WORKDIR=$joboption_directory" \
-    -S '@posix_shell@' "$LRMS_JOB_SCRIPT"
+    -S '@posix_shell@' < "$LRMS_JOB_SCRIPT"
 ) >"$LRMS_JOB_OUT" 2>"$LRMS_JOB_ERR"
 qsub_result=$?
 if [ "${CONFIG_sge_debug:-no}" = yes ]; then

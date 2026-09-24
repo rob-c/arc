@@ -20,8 +20,9 @@ emit_file () {
 case $command_name in
     qsub)
         /bin/pwd > "$TEST_ROOT/qsub.cwd"
-        for argument do submitted_script=$argument; done
-        /bin/cp "$submitted_script" "$TEST_ROOT/submitted.job"
+        # The job script arrives on stdin, the way qsub takes it and the way
+        # a qsub that forwards to a remote host can pass it on.
+        cat > "$TEST_ROOT/submitted.job"
         if [ -e "$TEST_ROOT/qsub.break_grami" ]; then
             rm -f "$GRAMI_FILE"
             ln -s /dev/full "$GRAMI_FILE"

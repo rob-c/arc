@@ -165,8 +165,10 @@ assert_success 'terse qsub success is accepted' run_submit "$TEST_ROOT/success.g
 assert_not_grep 'debug tracing is disabled by default' 'DEBUG event=' "$TEST_ROOT/stderr"
 assert_grep 'submission log correlates ARC and scheduler IDs' \
     'arc_job=arcjob .*event=submitted assigned_sge_job=73001' "$TEST_ROOT/stderr"
-assert_grep 'qsub uses terse output and ARC directive prefix' \
-    '^qsub -terse -b n -shell y -C #\$ -wd .+ -v __SGE_PREFIX__O_WORKDIR=.+ -S .+ .+/job\.script$' "$TEST_ROOT/calls"
+assert_grep 'qsub uses terse output and takes the script on stdin' \
+    '^qsub -terse -b n -shell y -wd .+ -v __SGE_PREFIX__O_WORKDIR=.+ -S [^ ]+$' "$TEST_ROOT/calls"
+assert_not_grep 'qsub passes no argument a remote shell would re-parse' \
+    '[#$*?\\]' "$TEST_ROOT/calls"
 assert_grep 'qsub ignores submission-directory request defaults' \
     '/sge-qsub\.[A-Za-z0-9]+$' "$TEST_ROOT/qsub.cwd"
 assert_grep 'the terse job ID is persisted in GRAMi' '^joboption_jobid=73001$' "$TEST_ROOT/success.grami"

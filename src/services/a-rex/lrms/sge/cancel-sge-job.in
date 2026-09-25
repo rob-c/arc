@@ -31,11 +31,32 @@ common_init
 # Engine reports one of the deletion states and completes it from qacct later.
 verify_jobid "$joboption_jobid" || exit 1
 
+# True only when Grid Engine itself reports that the job is not known.
+sge_job_gone () {
+    sge_check_output=`"$sge_qstat" -u '*' -s a -q '*' -j "$1" 2>&1`
+    [ $? -ne 0 ] && printf '%s\n' "$sge_check_output" | grep -i 'not exist' >/dev/null
+}
+
 sge_log "event=cancel command=$sge_qdel"
-"$sge_qdel" "$joboption_jobid"
+sge_qdel_output=`"$sge_qdel" "$joboption_jobid" 2>&1`
 sge_cancel_status=$?
+[ -z "$sge_qdel_output" ] || printf '%s\n' "$sge_qdel_output" 1>&2
 sge_log "event=cancel_result exit_status=$sge_cancel_status"
 if [ "$sge_cancel_status" -ne 0 ]; then
+    # A job can end between the cancellation request and qdel, and qdel then
+    # fails because the job no longer exists. There is nothing left to cancel:
+    # the scanner completes the job from its accounting record like any other
+    # finished job, so report success rather than a failed cancellation. This
+    # needs both qdel and a separate qstat to say the job is gone; any other
+    # failure, including being unable to ask, is still reported.
+    if printf '%s\n' "$sge_qdel_output" | grep -i 'does not exist' >/dev/null \
+        && sge_job_gone "$joboption_jobid"; then
+        sge_log "event=cancel_result outcome=already_finished"
+        echo "SGE job $joboption_jobid had already finished; nothing to cancel" 1>&2
+        echo "----- exiting cancel_sge_job -----" 1>&2
+        echo "" 1>&2
+        exit 0
+    fi
     echo "qdel failed for SGE job $joboption_jobid" 1>&2
     echo "----- exiting cancel_sge_job -----" 1>&2
     exit 1

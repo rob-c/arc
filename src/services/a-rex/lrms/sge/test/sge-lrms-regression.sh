@@ -1336,6 +1336,40 @@ reset_scheduler
 printf "joboption_jobid='89'\n" > "$TEST_ROOT/qdel-success.grami"
 assert_success 'successful qdel completes cancellation request' run_cancel "$TEST_ROOT/qdel-success.grami"
 
+# A job that ends before its qdel leaves nothing to cancel. Grid Engine must
+# say so twice: qdel's rejection and an independent qstat.
+reset_scheduler
+printf "joboption_jobid='90'\n" > "$TEST_ROOT/qdel-gone.grami"
+printf 'denied: job "90" does not exist\n' > "$TEST_ROOT/qdel.output"
+printf '1\n' > "$TEST_ROOT/qdel.rc"
+printf 'Following jobs do not exist or permissions are not sufficient: \n90\n' > "$TEST_ROOT/qstat.job.output"
+printf '1\n' > "$TEST_ROOT/qstat.job.rc"
+assert_success 'cancelling a job that has already finished succeeds' run_cancel "$TEST_ROOT/qdel-gone.grami"
+assert_grep 'the vanished job is confirmed by qstat' '^qstat -u \* -s a -q \* -j 90$' "$TEST_ROOT/calls"
+assert_grep 'the already-finished outcome is logged' 'sge_job=90 event=cancel_result outcome=already_finished' "$TEST_ROOT/stderr"
+assert_not_grep 'no failed cancellation is reported for a finished job' 'qdel failed' "$TEST_ROOT/stderr"
+assert_grep 'the qdel answer is kept in the job log' 'does not exist' "$TEST_ROOT/stderr"
+
+reset_scheduler
+printf 'denied: job "90" does not exist\n' > "$TEST_ROOT/qdel.output"
+printf '1\n' > "$TEST_ROOT/qdel.rc"
+printf 'job_number: 90\n' > "$TEST_ROOT/qstat.job.output"
+printf '0\n' > "$TEST_ROOT/qstat.job.rc"
+assert_failure 'a job qstat still lists is not taken as finished' run_cancel "$TEST_ROOT/qdel-gone.grami"
+
+reset_scheduler
+printf 'denied: job "90" does not exist\n' > "$TEST_ROOT/qdel.output"
+printf '1\n' > "$TEST_ROOT/qdel.rc"
+printf 'error: unable to contact qmaster\n' > "$TEST_ROOT/qstat.job.output"
+printf '1\n' > "$TEST_ROOT/qstat.job.rc"
+assert_failure 'an unconfirmed disappearance is still a failed cancellation' run_cancel "$TEST_ROOT/qdel-gone.grami"
+
+reset_scheduler
+printf 'denied: job "90" has no permission\n' > "$TEST_ROOT/qdel.output"
+printf '1\n' > "$TEST_ROOT/qdel.rc"
+assert_failure 'any other qdel failure is propagated' run_cancel "$TEST_ROOT/qdel-gone.grami"
+assert_not_grep 'other qdel failures need no extra scheduler query' '^qstat ' "$TEST_ROOT/calls"
+
 # Tracing must not alter the submission protocol or expose native -v values.
 reset_scheduler
 write_submit_grami "$TEST_ROOT/debug.grami" 1
